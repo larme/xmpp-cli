@@ -75,6 +75,30 @@ The current `cl-xmpp` backend supports `SCRAM-SHA-1`, `PLAIN`, and
 channel binding data from the TLS stream; the current `cl+ssl` integration
 does not expose that data to this backend.
 
+## Codex XMPP Hook
+
+This repository includes an installable Codex hook that sends XMPP
+notifications when Codex finishes a turn or needs human approval. It assumes
+`xmpp-cli` is installed in `PATH` and already has a usable default profile.
+
+```sh
+./scripts/install-codex-xmpp-hook.sh you@example.org
+```
+
+You can also supply the recipient through the environment:
+
+```sh
+CODEX_XMPP_NOTIFY_TO=you@example.org ./scripts/install-codex-xmpp-hook.sh
+```
+
+The installer copies `codex-hooks/xmpp-notify.py` into
+`$CODEX_HOME/hooks/` or `~/.codex/hooks/`, enables `codex_hooks`, and registers
+`Stop` plus `PermissionRequest` hooks in `config.toml`. The recipient is stored
+in `xmpp-notify.env` beside the installed hook, not in the hook source or Codex
+config. At runtime, `CODEX_XMPP_NOTIFY_TO` overrides that file. Notification
+headers include the event, hostname, Git repository root, current working
+directory, and tool name when Codex is waiting for approval.
+
 ## Tests
 
 The test system covers JID parsing, config round trips, history metadata, CLI validation, and CLI send behavior through a fake backend.

@@ -28,3 +28,5 @@ core
 # CVS default ignores end
 
 /build/xmpp-cli
+
+__pycache__
