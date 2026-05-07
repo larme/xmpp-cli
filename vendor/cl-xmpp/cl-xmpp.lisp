@@ -337,13 +337,55 @@ to HANDLE)."
       (car (funcall callback stanza connection :dom-repr dom-repr)))))
 
 
+(defun prefix-input-stream (prefix stream)
+  (if (zerop (length prefix))
+      stream
+      (make-concatenated-stream
+       (flexi-streams:make-in-memory-input-stream prefix)
+       stream)))
+
+(defun strip-leading-xml-declaration (stream)
+  "Return an input stream positioned after a leading XML declaration.
+
+FXML currently misparses XML declarations from octet streams on LispWorks.
+XMPP stream declarations are optional, so dropping the server declaration
+before Klacks sees the stream keeps the parser on the stanza data."
+  (handler-case
+      (progn
+        (let ((prefix (make-array 0
+                                  :element-type '(unsigned-byte 8)
+                                  :adjustable t
+                                  :fill-pointer 0))
+              (xml-prefix #(60 63 120 109 108))) ; "<?xml"
+          (loop for expected across xml-prefix
+                for byte = (read-byte stream nil nil)
+                do (cond
+                     ((null byte)
+                      (return-from strip-leading-xml-declaration
+                        (prefix-input-stream prefix stream)))
+                     (t
+                      (vector-push-extend byte prefix)
+                      (unless (= byte expected)
+                        (return-from strip-leading-xml-declaration
+                          (prefix-input-stream prefix stream)))))))
+        (loop with previous = nil
+              for byte = (read-byte stream nil nil)
+              while byte
+              do (when (and previous (= previous 63) (= byte 62)) ; "?>"
+                   (return-from strip-leading-xml-declaration stream))
+                 (setf previous byte))
+        stream)
+    (error ()
+      stream)))
+
 (defun read-stanza (connection)
   (unless (connectedp connection)
     (signal 'server-disconnect))
   (unless (server-source connection)
     (setf (server-source connection)
           (cxml:make-source
-           (cxml:make-xstream (server-stream connection)
+           (cxml:make-xstream (strip-leading-xml-declaration
+                               (server-stream connection))
                               :speed 1
                               :name
                               (cxml::make-stream-name

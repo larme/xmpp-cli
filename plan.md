@@ -86,7 +86,8 @@ xmpp-cli/
   README.md
   plan.md
   xmpp-cli.asd
-  build.sh
+  scripts/
+    build.sh
   build/
     deliver.lisp
   src/
@@ -137,15 +138,16 @@ For a vendored LispWorks-native TLS fork, update dependencies later so the proje
 
 ## 5. Build script and delivery
 
-### `build.sh`
+### `scripts/build.sh`
 
-Create `build.sh`:
+Create `scripts/build.sh`:
 
 ```sh
 #!/bin/sh
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 mkdir -p "$ROOT/build"
 
 exec lw-console -build "$ROOT/build/deliver.lisp"
@@ -154,7 +156,7 @@ exec lw-console -build "$ROOT/build/deliver.lisp"
 Make it executable:
 
 ```sh
-chmod +x build.sh
+chmod +x scripts/build.sh
 ```
 
 ### `build/deliver.lisp`
@@ -306,7 +308,7 @@ $HOME/.local/xmpp-cli/logs/
    :host "example.org"
    :port 5222
    :resource "xmpp-cli"
-   :mechanism :sasl-plain
+   :mechanism :auto
    :password "APP-SPECIFIC-PASSWORD-HERE")))
 ```
 
@@ -371,7 +373,7 @@ Options:
 --host HOST          XMPP host. Default: domain part of JID
 --port PORT          XMPP client port. Default: 5222
 --resource RESOURCE  XMPP resource. Default: xmpp-cli
---mechanism NAME     SASL mechanism keyword. Default: sasl-plain
+--mechanism NAME     SASL mechanism keyword. Default: auto
 --password-stdin     Read one password line from stdin
 ```
 
@@ -512,7 +514,7 @@ Suggested helper shape:
          (host      (or (getf profile :host) domain))
          (port      (or (getf profile :port) 5222))
          (resource  (or (getf profile :resource) "xmpp-cli"))
-         (mechanism (or (getf profile :mechanism) :sasl-plain))
+         (mechanism (or (getf profile :mechanism) :auto))
          (connection nil))
     (unwind-protect
          (progn
@@ -854,7 +856,7 @@ Verify:
 Run:
 
 ```sh
-./build.sh
+./scripts/build.sh
 ./build/xmpp-cli --help
 ./build/xmpp-cli --version
 ```
@@ -867,7 +869,7 @@ Then repeat manual login/send tests with the delivered binary, not only from the
 
 - [ ] Add `xmpp-cli.asd`.
 - [ ] Add package definitions.
-- [ ] Add `build.sh`.
+- [ ] Add `scripts/build.sh`.
 - [ ] Add `build/deliver.lisp`.
 - [ ] Add a minimal `entry-point` and `cli:run` that supports `--help`.
 - [ ] Confirm `lw-console -build build/deliver.lisp` produces `build/xmpp-cli`.
