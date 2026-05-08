@@ -16,7 +16,16 @@ The delivered binary is written to:
 build/xmpp-cli
 ```
 
-`build/deliver.lisp` loads Quicklisp at build time, registers this project and `vendor/cl-xmpp`, quickloads `xmpp-cli`, and delivers at level `0`. The delivered binary should not need Quicklisp at runtime.
+`build/deliver.lisp` loads Quicklisp at build time, registers this project and `vendor/cl-xmpp`, quickloads `xmpp-cli`, and delivers at level `2` by default. The delivered binary should not need Quicklisp at runtime.
+
+Use `DELIVERY_LEVEL` to tune LispWorks delivery size versus risk while testing:
+
+```sh
+DELIVERY_LEVEL=0 ./scripts/build.sh   # largest, keeps delivered debug support by default
+DELIVERY_LEVEL=3 ./scripts/build.sh   # smaller, needs runtime testing
+```
+
+Set `DELIVERY_DEBUG=1` when you need LispWorks delivered-image debugger support at a higher delivery level, or `DELIVERY_DEBUG=0` to force it off for a level `0` build. The delivery script keeps LispWorks reader and pretty-printer support because runtime config/history loading uses `read` and XMPP error paths may print XML objects. Do not run `strip` on the delivered executable; it removes the LispWorks image trailer and corrupts the binary.
 
 ## Usage
 

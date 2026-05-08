@@ -35,6 +35,28 @@
       (error "Quicklisp package QL:QUICKLOAD is not available."))
     (funcall function system :silent nil)))
 
+(defun parse-delivery-level ()
+  (let ((raw (uiop:getenv "DELIVERY_LEVEL")))
+    (if (and raw (plusp (length raw)))
+        (let ((level (parse-integer raw :junk-allowed nil)))
+          (unless (<= 0 level 5)
+            (error "DELIVERY_LEVEL must be between 0 and 5, got ~a." raw))
+          level)
+        2)))
+
+(defun env-true-p (name)
+  (let ((raw (uiop:getenv name)))
+    (and raw
+         (not (member (string-downcase raw)
+                      '("" "0" "false" "no" "nil")
+                      :test #'string=)))))
+
+(defun delivery-debug-p (level)
+  (let ((raw (uiop:getenv "DELIVERY_DEBUG")))
+    (if raw
+        (env-true-p "DELIVERY_DEBUG")
+        (zerop level))))
+
 (let* ((root (project-root))
        (vendor-cl-xmpp (merge-pathnames "vendor/cl-xmpp/" root)))
   (load-quicklisp)
@@ -51,11 +73,25 @@
   (ensure-directories-exist (merge-pathnames "build/" root))
 
   #+lispworks
-  (let ((entry-point (intern "ENTRY-POINT" "XMPP-CLI/MAIN")))
+  (let* ((entry-point (intern "ENTRY-POINT" "XMPP-CLI/MAIN"))
+         (output (merge-pathnames "build/xmpp-cli" root))
+         (level (parse-delivery-level))
+         (debug-p (delivery-debug-p level)))
+    (format t "~&Delivering xmpp-cli at level ~d~@[ with delivery debug support~]...~%"
+            level
+            debug-p)
     (deliver entry-point
-             (merge-pathnames "build/xmpp-cli" root)
-             0
-             :multiprocessing nil))
+             output
+             level
+             :multiprocessing nil
+             :keep-debug-mode debug-p
+             :keep-stub-functions debug-p
+             :keep-function-name (if debug-p t :minimal)
+             :keep-conditions :all
+             :keep-eval debug-p
+             :keep-pretty-printer t
+             :keep-lisp-reader t
+             :keep-load-function (and debug-p :full)))
 
   #-lispworks
   (error "build/deliver.lisp must be run with LispWorks."))
