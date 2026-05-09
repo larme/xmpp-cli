@@ -101,7 +101,7 @@ CODEX_XMPP_NOTIFY_TO=you@example.org ./scripts/install-codex-xmpp-hook.sh
 ```
 
 The installer copies `codex-hooks/xmpp-notify.py` into
-`$CODEX_HOME/hooks/` or `~/.codex/hooks/`, enables `codex_hooks`, and registers
+`$CODEX_HOME/hooks/` or `~/.codex/hooks/`, enables Codex hooks, and registers
 `Stop` plus `PermissionRequest` hooks in `config.toml`. The recipient is stored
 in `xmpp-notify.env` beside the installed hook, not in the hook source or Codex
 config. At runtime, `CODEX_XMPP_NOTIFY_TO` overrides that file. Notification

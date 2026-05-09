@@ -85,7 +85,8 @@ def ensure_feature(text):
     lines = text.splitlines(keepends=True)
     feature_header = re.compile(r"^\s*\[features\]\s*(?:#.*)?$")
     section_header = re.compile(r"^\s*\[")
-    codex_hooks = re.compile(r"^(\s*)codex_hooks\s*=.*$")
+    hooks = re.compile(r"^\s*hooks\s*=.*$")
+    deprecated_codex_hooks = re.compile(r"^\s*codex_hooks\s*=.*$")
 
     for index, line in enumerate(lines):
         if not feature_header.match(line):
@@ -97,12 +98,20 @@ def ensure_feature(text):
                 section_end = next_index
                 break
 
-        for hook_index in range(index + 1, section_end):
-            if codex_hooks.match(lines[hook_index]):
-                lines[hook_index] = "codex_hooks = true\n"
-                return "".join(lines)
+        section = []
+        saw_hooks = False
+        for feature_line in lines[index + 1:section_end]:
+            if deprecated_codex_hooks.match(feature_line):
+                continue
+            if hooks.match(feature_line):
+                section.append("hooks = true\n")
+                saw_hooks = True
+            else:
+                section.append(feature_line)
 
-        lines.insert(index + 1, "codex_hooks = true\n")
+        if not saw_hooks:
+            section.insert(0, "hooks = true\n")
+        lines[index + 1:section_end] = section
         return "".join(lines)
 
     insert_at = len(lines)
@@ -111,7 +120,7 @@ def ensure_feature(text):
             insert_at = index
             break
 
-    prefix = ["[features]\n", "codex_hooks = true\n", "\n"]
+    prefix = ["[features]\n", "hooks = true\n", "\n"]
     lines[insert_at:insert_at] = prefix
     return "".join(lines)
 
