@@ -11,6 +11,7 @@
                "cl-base64"
                "cl-xmpp/tls"
                "cl-scram"
+               "com.inuoe.jzon"
                "ironclad"
                "uiop")
   :serial t
@@ -21,10 +22,13 @@
     ((:file "package")
      (:file "util")
      (:file "yaml")
+     (:file "json")
      (:file "state")
      (:file "history")
      (:file "agent-config")
      (:file "agent-routes")
+     (:file "tmux")
+     (:file "agent-codex")
      (:file "xmpp-backend")
      (:file "xmpp-cl-xmpp")
      (:file "cli")

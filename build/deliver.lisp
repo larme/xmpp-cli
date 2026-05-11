@@ -57,6 +57,12 @@
         (env-true-p "DELIVERY_DEBUG")
         (zerop level))))
 
+(defun delivery-output-pathname (root)
+  (let ((raw (uiop:getenv "XMPP_CLI_DELIVERY_OUTPUT")))
+    (if (and raw (plusp (length raw)))
+        (pathname raw)
+        (merge-pathnames "build/xmpp-cli" root))))
+
 (let* ((root (project-root))
        (vendor-cl-xmpp (merge-pathnames "vendor/cl-xmpp/" root)))
   (load-quicklisp)
@@ -74,7 +80,7 @@
 
   #+lispworks
   (let* ((entry-point (intern "ENTRY-POINT" "XMPP-CLI/MAIN"))
-         (output (merge-pathnames "build/xmpp-cli" root))
+         (output (delivery-output-pathname root))
          (level (parse-delivery-level))
          (debug-p (delivery-debug-p level)))
     (format t "~&Delivering xmpp-cli at level ~d~@[ with delivery debug support~]...~%"

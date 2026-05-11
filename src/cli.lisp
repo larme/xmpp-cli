@@ -236,6 +236,73 @@
       (format t "removed XMPP sender ~a~%" jid)
       +exit-success+)))
 
+(defun notify-codex-warning (control &rest arguments)
+  (format t "~a~%"
+          (json-compact-string
+           (list (cons "systemMessage"
+                       (format nil "xmpp-cli: ~?" control arguments)))))
+  +exit-success+)
+
+(defun handle-agent-notify-codex (cmd)
+  (declare (ignore cmd))
+  (let* ((payload
+           (handler-case
+               (read-codex-payload)
+             (error (condition)
+               (return-from handle-agent-notify-codex
+                 (notify-codex-warning
+                  "could not parse Codex hook JSON payload: ~a"
+                  condition)))))
+         (agent-config (load-agent-config)))
+    (unless (notify-to agent-config)
+      (return-from handle-agent-notify-codex
+        (notify-codex-warning
+         "no XMPP notification target configured; run xmpp-cli agent config set-notify-to <jid>")))
+    (let* ((state-config (load-config))
+           (profile-name (getf agent-config :profile "default"))
+           (profile-plist (profile state-config profile-name)))
+      (unless profile-plist
+        (return-from handle-agent-notify-codex
+          (notify-codex-warning
+           "no auth/profile data found for profile ~a; run xmpp-cli login first"
+           profile-name)))
+      (let* ((notification
+               (handler-case
+                   (build-codex-notification payload agent-config)
+                 (error (condition)
+                   (return-from handle-agent-notify-codex
+                     (notify-codex-warning
+                      "could not build Codex notification: ~a"
+                      condition)))))
+             (target (notification-target notification))
+             (body (notification-body notification))
+             (send-error
+               (handler-case
+                   (progn
+                     (send-text (funcall *backend-factory*) profile-plist target body)
+                     nil)
+                 (error (condition)
+                   condition))))
+        (if send-error
+            (progn
+              (ignore-errors
+                (append-send-history profile-name
+                                     target
+                                     :codex-notification
+                                     body
+                                     :failed
+                                     :error (princ-to-string send-error)))
+              (notify-codex-warning
+               "codex notification send failed: ~a"
+               send-error))
+            (progn
+              (maybe-append-send-history profile-name
+                                         target
+                                         :codex-notification
+                                         body
+                                         :sent)
+              +exit-success+))))))
+
 (defun login-command ()
   (clingon:make-command
    :name "login"
@@ -299,6 +366,12 @@
                        (agent-config-allow-sender-command)
                        (agent-config-remove-sender-command))))
 
+(defun agent-notify-codex-command ()
+  (clingon:make-command
+   :name "notify-codex"
+   :description "send a route-coded XMPP notification from a Codex hook payload"
+   :handler #'handle-agent-notify-codex))
+
 (defun agent-handler (cmd)
   (clingon:print-usage cmd t)
   +exit-usage+)
@@ -308,7 +381,8 @@
    :name "agent"
    :description "manage XMPP agent bridge features"
    :handler #'agent-handler
-   :sub-commands (list (agent-config-command))))
+   :sub-commands (list (agent-config-command)
+                       (agent-notify-codex-command))))
 
 (defun top-level-handler (cmd)
   (clingon:print-usage cmd t)

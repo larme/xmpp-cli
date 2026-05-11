@@ -6,11 +6,8 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 TARGET="${1:-${CODEX_XMPP_NOTIFY_TO:-}}"
-HOOK_SRC="$ROOT/codex-hooks/xmpp-notify.py"
-HOOK_DIR="$CODEX_HOME/hooks"
-HOOK_DEST="$HOOK_DIR/xmpp-notify.py"
-ENV_DEST="$HOOK_DIR/xmpp-notify.env"
 CONFIG="$CODEX_HOME/config.toml"
+XMPP_CLI="${XMPP_CLI:-$(command -v xmpp-cli || true)}"
 
 PYTHON_BIN="$(command -v python3 || true)"
 if [ "$#" -gt 1 ] || [ -z "$TARGET" ]; then
@@ -28,23 +25,21 @@ case "$TARGET" in
 esac
 
 if [ -z "$PYTHON_BIN" ]; then
-  printf 'python3 is required to install and run the Codex XMPP hook\n' >&2
+  printf 'python3 is required to update the Codex config\n' >&2
   exit 1
 fi
 
-if ! command -v xmpp-cli >/dev/null 2>&1; then
-  printf 'warning: xmpp-cli is not currently in PATH; install it before Codex runs the hook\n' >&2
+if [ -z "$XMPP_CLI" ]; then
+  printf 'xmpp-cli is not currently in PATH; install it or set XMPP_CLI=/path/to/xmpp-cli\n' >&2
+  exit 1
 fi
 
-mkdir -p "$HOOK_DIR"
-install -m 700 "$HOOK_SRC" "$HOOK_DEST"
-tmp_env="$ENV_DEST.$$"
-printf 'CODEX_XMPP_NOTIFY_TO=%s\n' "$TARGET" > "$tmp_env"
-chmod 600 "$tmp_env"
-mv "$tmp_env" "$ENV_DEST"
+"$XMPP_CLI" agent config set-notify-to "$TARGET" >/dev/null
+
+mkdir -p "$CODEX_HOME"
 touch "$CONFIG"
 
-export CONFIG HOOK_DEST PYTHON_BIN
+export CONFIG XMPP_CLI
 python3 <<'PY'
 import json
 import os
@@ -54,9 +49,8 @@ from pathlib import Path
 
 
 config_path = Path(os.environ["CONFIG"])
-hook_dest = os.environ["HOOK_DEST"]
-python_bin = os.environ["PYTHON_BIN"]
-command = f"{shlex.quote(python_bin)} {shlex.quote(hook_dest)}"
+xmpp_cli = os.environ["XMPP_CLI"]
+command = f"{shlex.quote(xmpp_cli)} agent notify-codex"
 
 start_marker = "# BEGIN xmpp-cli Codex XMPP hook"
 end_marker = "# END xmpp-cli Codex XMPP hook"
@@ -143,6 +137,5 @@ if command -v codex >/dev/null 2>&1; then
   codex debug prompt-input "codex xmpp hook config check" >/dev/null
 fi
 
-printf 'Installed Codex XMPP hook to %s\n' "$HOOK_DEST"
-printf 'Wrote private hook config to %s\n' "$ENV_DEST"
+printf 'Configured XMPP notification target in ~/.local/xmpp-cli/agent/config.yaml\n'
 printf 'Updated Codex config at %s\n' "$CONFIG"

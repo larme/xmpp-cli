@@ -44,10 +44,31 @@
                       :direction :input
                       :element-type 'character
                       :external-format :utf-8)
-    (with-output-to-string (out)
-      (loop for ch = (read-char in nil nil)
-            while ch
-            do (write-char ch out)))))
+    (read-stream-as-string in)))
+
+(defun read-stream-as-string (stream)
+  (with-output-to-string (out)
+    (loop for ch = (read-char stream nil nil)
+          while ch
+          do (write-char ch out))))
+
+(defun trim-trailing-slashes (string)
+  (let ((end (length string)))
+    (loop while (and (> end 1)
+                     (char= (char string (1- end)) #\/))
+          do (decf end))
+    (subseq string 0 end)))
+
+(defun display-path (path)
+  (let* ((text (if (pathnamep path) (namestring path) (or path "")))
+         (home (trim-trailing-slashes (namestring (user-homedir-pathname))))
+         (prefix (concatenate 'string home "/")))
+    (cond
+      ((string= text home) "~")
+      ((and (<= (length prefix) (length text))
+            (string= prefix text :end2 (length prefix)))
+       (concatenate 'string "~/" (subseq text (length prefix))))
+      (t text))))
 
 (defun split-jid (jid)
   "Return USER and DOMAIN from a bare JID user@domain. Signal an error otherwise."

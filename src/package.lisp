@@ -5,6 +5,8 @@
    #:ensure-private-directory
    #:write-private-file
    #:read-file-as-string
+   #:read-stream-as-string
+   #:display-path
    #:split-jid
    #:now-iso8601
    #:utf-8-octets
@@ -23,6 +25,15 @@
    #:yaml-value
    #:yaml-null
    #:yaml-null-p))
+
+(defpackage #:xmpp-cli/json
+  (:use #:cl)
+  (:export
+   #:parse-json
+   #:json-value
+   #:json-null
+   #:json-null-p
+   #:json-compact-string))
 
 (defpackage #:xmpp-cli/state
   (:use #:cl)
@@ -110,6 +121,43 @@
    #:ensure-route
    #:find-route-by-code))
 
+(defpackage #:xmpp-cli/tmux
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:home-xmpp-cli-directory
+                #:ensure-private-directory
+                #:write-private-file)
+  (:export
+   #:capture-context
+   #:context-available-p
+   #:focus-pane
+   #:paste-text-and-enter))
+
+(defpackage #:xmpp-cli/agent-codex
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:display-path
+                #:read-stream-as-string)
+  (:import-from #:xmpp-cli/json
+                #:parse-json
+                #:json-value
+                #:json-null-p
+                #:json-compact-string)
+  (:import-from #:xmpp-cli/agent-config
+                #:notify-to)
+  (:import-from #:xmpp-cli/agent-routes
+                #:canonical-route-identity
+                #:ensure-route)
+  (:import-from #:xmpp-cli/tmux
+                #:capture-context
+                #:context-available-p)
+  (:export
+   #:read-codex-payload
+   #:build-codex-notification
+   #:notification-target
+   #:notification-body
+   #:notification-route))
+
 (defpackage #:xmpp-cli/backend
   (:use #:cl)
   (:export
@@ -144,9 +192,17 @@
                 #:load-agent-config
                 #:save-agent-config
                 #:agent-config-as-yaml
+                #:notify-to
                 #:set-notify-to
                 #:add-allowed-sender
                 #:remove-allowed-sender)
+  (:import-from #:xmpp-cli/agent-codex
+                #:read-codex-payload
+                #:build-codex-notification
+                #:notification-target
+                #:notification-body)
+  (:import-from #:xmpp-cli/json
+                #:json-compact-string)
   (:import-from #:xmpp-cli/yaml
                 #:emit-yaml)
   (:import-from #:xmpp-cli/backend
