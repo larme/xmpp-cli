@@ -91,6 +91,10 @@
                         :description "Read message body from a UTF-8 text file"
                         :key :file)))
 
+(defun command-usage-error (cmd message)
+  (clingon:print-usage cmd *error-output*)
+  (fail +exit-usage+ "~a" message))
+
 (defun handle-login (cmd)
   (let ((args (clingon:command-arguments cmd)))
     (unless (= (length args) 1)
@@ -197,6 +201,41 @@
               (format t "sent to ~a using profile ~a~%" recipient profile-name)
               +exit-success+))))))
 
+(defun handle-agent-config-show (cmd)
+  (declare (ignore cmd))
+  (format t "~a" (emit-yaml (agent-config-as-yaml (load-agent-config))))
+  +exit-success+)
+
+(defun handle-agent-config-set-notify-to (cmd)
+  (let ((args (clingon:command-arguments cmd)))
+    (unless (= (length args) 1)
+      (command-usage-error cmd "Usage: xmpp-cli agent config set-notify-to <jid>"))
+    (let* ((jid (first args))
+           (config (set-notify-to (load-agent-config) jid)))
+      (save-agent-config config)
+      (format t "set XMPP notification target to ~a~%" jid)
+      +exit-success+)))
+
+(defun handle-agent-config-allow-sender (cmd)
+  (let ((args (clingon:command-arguments cmd)))
+    (unless (= (length args) 1)
+      (command-usage-error cmd "Usage: xmpp-cli agent config allow-sender <jid>"))
+    (let* ((jid (first args))
+           (config (add-allowed-sender (load-agent-config) jid)))
+      (save-agent-config config)
+      (format t "allowed XMPP sender ~a~%" jid)
+      +exit-success+)))
+
+(defun handle-agent-config-remove-sender (cmd)
+  (let ((args (clingon:command-arguments cmd)))
+    (unless (= (length args) 1)
+      (command-usage-error cmd "Usage: xmpp-cli agent config remove-sender <jid>"))
+    (let* ((jid (first args))
+           (config (remove-allowed-sender (load-agent-config) jid)))
+      (save-agent-config config)
+      (format t "removed XMPP sender ~a~%" jid)
+      +exit-success+)))
+
 (defun login-command ()
   (clingon:make-command
    :name "login"
@@ -219,6 +258,58 @@
                ("Send UTF-8 text file contents:"
                 . "xmpp-cli send friend@example.org -f ./message.txt"))))
 
+(defun agent-config-show-command ()
+  (clingon:make-command
+   :name "show"
+   :description "show XMPP agent bridge configuration"
+   :handler #'handle-agent-config-show))
+
+(defun agent-config-set-notify-to-command ()
+  (clingon:make-command
+   :name "set-notify-to"
+   :description "set the XMPP notification recipient"
+   :usage "<jid>"
+   :handler #'handle-agent-config-set-notify-to))
+
+(defun agent-config-allow-sender-command ()
+  (clingon:make-command
+   :name "allow-sender"
+   :description "allow a JID to send agent replies"
+   :usage "<jid>"
+   :handler #'handle-agent-config-allow-sender))
+
+(defun agent-config-remove-sender-command ()
+  (clingon:make-command
+   :name "remove-sender"
+   :description "remove a JID from the allowed reply sender list"
+   :usage "<jid>"
+   :handler #'handle-agent-config-remove-sender))
+
+(defun agent-config-handler (cmd)
+  (clingon:print-usage cmd t)
+  +exit-usage+)
+
+(defun agent-config-command ()
+  (clingon:make-command
+   :name "config"
+   :description "manage XMPP agent bridge configuration"
+   :handler #'agent-config-handler
+   :sub-commands (list (agent-config-show-command)
+                       (agent-config-set-notify-to-command)
+                       (agent-config-allow-sender-command)
+                       (agent-config-remove-sender-command))))
+
+(defun agent-handler (cmd)
+  (clingon:print-usage cmd t)
+  +exit-usage+)
+
+(defun agent-command ()
+  (clingon:make-command
+   :name "agent"
+   :description "manage XMPP agent bridge features"
+   :handler #'agent-handler
+   :sub-commands (list (agent-config-command))))
+
 (defun top-level-handler (cmd)
   (clingon:print-usage cmd t)
   +exit-usage+)
@@ -230,7 +321,7 @@
    :version "0.1.0"
    :license "MIT"
    :handler #'top-level-handler
-   :sub-commands (list (login-command) (send-command))))
+   :sub-commands (list (login-command) (send-command) (agent-command))))
 
 (defun usage-condition-p (condition)
   (or (typep condition 'clingon:unknown-option)

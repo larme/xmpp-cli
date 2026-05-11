@@ -7,10 +7,10 @@
         :profiles nil))
 
 (defun config-pathname ()
-  (merge-pathnames "config.sexp" (home-xmpp-cli-directory)))
+  (merge-pathnames "config.yaml" (home-xmpp-cli-directory)))
 
 (defun config-temp-pathname ()
-  (merge-pathnames "config.sexp.tmp" (home-xmpp-cli-directory)))
+  (merge-pathnames "config.yaml.tmp" (home-xmpp-cli-directory)))
 
 (defun proper-plist-p (plist)
   (and (listp plist) (evenp (length plist))))
@@ -19,33 +19,79 @@
   (unless (and (consp entry)
                (stringp (first entry))
                (proper-plist-p (rest entry)))
-    (error "Malformed profile entry in config.sexp: ~s" entry))
+    (error "Malformed profile entry in config.yaml: ~s" entry))
   entry)
 
 (defun validate-config (config)
   (unless (proper-plist-p config)
-    (error "Malformed config.sexp: expected a property list, got ~s" config))
+    (error "Malformed config.yaml: expected a property list, got ~s" config))
   (let ((default (getf config :default-profile *default-profile-name*))
         (profiles (getf config :profiles nil)))
     (unless (stringp default)
-      (error "Malformed config.sexp: :default-profile must be a string."))
+      (error "Malformed config.yaml: default_profile must be a string."))
     (unless (listp profiles)
-      (error "Malformed config.sexp: :profiles must be a list."))
+      (error "Malformed config.yaml: profiles must be a list."))
     (mapc #'validate-profile-entry profiles)
     config))
 
+(defun keyword-to-yaml-key (keyword)
+  (substitute #\_ #\- (string-downcase (symbol-name keyword))))
+
+(defun yaml-key-to-keyword (key)
+  (intern (string-upcase (substitute #\- #\_ key)) :keyword))
+
+(defun profile-value-to-yaml (value)
+  (if (keywordp value)
+      (string-downcase (symbol-name value))
+      value))
+
+(defun yaml-value-to-profile-value (key value)
+  (cond
+    ((string= key "mechanism")
+     (intern (string-upcase value) :keyword))
+    ((yaml-null-p value)
+     nil)
+    (t value)))
+
+(defun profile-to-yaml (entry)
+  (let ((plist (rest entry))
+        (mapping (list (cons "name" (first entry)))))
+    (loop for (key value) on plist by #'cddr
+          do (push (cons (keyword-to-yaml-key key)
+                         (profile-value-to-yaml value))
+                   mapping))
+    (nreverse mapping)))
+
+(defun yaml-to-profile-entry (mapping)
+  (unless (listp mapping)
+    (error "Malformed config.yaml: profile entry must be a mapping."))
+  (let ((name (yaml-value mapping "name")))
+    (unless (and (stringp name) (plusp (length name)))
+      (error "Malformed config.yaml: profile name must be a non-empty string."))
+    (cons name
+          (loop for (key . value) in mapping
+                unless (string= key "name")
+                  append (list (yaml-key-to-keyword key)
+                               (yaml-value-to-profile-value key value))))))
+
+(defun config-to-yaml (config)
+  (validate-config config)
+  (list (cons "default_profile" (default-profile-name config))
+        (cons "profiles" (mapcar #'profile-to-yaml
+                                  (getf config :profiles)))))
+
+(defun yaml-to-config (yaml)
+  (unless (listp yaml)
+    (error "Malformed config.yaml: expected a mapping."))
+  (validate-config
+   (list :default-profile (yaml-value yaml
+                                      "default_profile"
+                                      *default-profile-name*)
+         :profiles (mapcar #'yaml-to-profile-entry
+                           (yaml-value yaml "profiles" nil)))))
+
 (defun read-config-file (pathname)
-  (with-open-file (in pathname
-                      :direction :input
-                      :element-type 'character
-                      :external-format :utf-8)
-    (with-standard-io-syntax
-      (let ((*read-eval* nil)
-            (eof (list :eof)))
-        (let ((object (read in nil eof)))
-          (when (eq object eof)
-            (error "Malformed config.sexp: empty file."))
-          (validate-config object))))))
+  (yaml-to-config (read-yaml-file pathname)))
 
 (defun load-config ()
   (let ((pathname (config-pathname)))
@@ -53,22 +99,12 @@
         (read-config-file pathname)
         (empty-config))))
 
-(defun print-sexpression (object)
-  (with-output-to-string (out)
-    (write object
-           :stream out
-           :case :downcase
-           :circle nil
-           :pretty nil
-           :readably t)
-    (terpri out)))
-
 (defun save-config (config)
   (validate-config config)
   (ensure-private-directory)
   (let ((temp (config-temp-pathname))
         (target (config-pathname)))
-    (write-private-file temp (print-sexpression config))
+    (write-yaml-file temp (config-to-yaml config))
     (uiop:rename-file-overwriting-target temp target)
     target))
 

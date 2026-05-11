@@ -85,7 +85,7 @@
       (check-equal :send-text (caar events))
       (let* ((text (xmpp-cli/util:read-file-as-string
                     (xmpp-cli/history:history-pathname)))
-             (history (read-from-string text))
+             (history (xmpp-cli/history::load-history))
              (entry (first history)))
         (check-equal :sent (getf entry :result))
         (check-equal 5 (getf entry :bytes))
