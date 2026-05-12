@@ -289,6 +289,40 @@
         (check (not default-route-p)
                "reply with an active route code should stay explicit")))))
 
+(deftest agent-reply-unknown-code-does-not-use-default-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-b"
+                        :code "bbbb"
+                        :identity "route-b"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (multiple-value-bind (matched text default-route-p unknown-code)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "ZZZZ please rerun this")
+        (check (null matched)
+               "unknown route-looking tokens should not match a route")
+        (check (null text)
+               "unknown route-looking tokens should not be sent as feedback")
+        (check (not default-route-p)
+               "unknown route-looking tokens should not fall back")
+        (check-equal "zzzz" unknown-code))
+      (multiple-value-bind (matched text default-route-p unknown-code)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "z9zz please rerun this")
+        (check-equal "bbbb" (getf matched :code))
+        (check-equal "z9zz please rerun this" text)
+        (check default-route-p
+               "tokens with digits should still use the default route")
+        (check (null unknown-code)
+               "tokens with digits should not be treated as route codes")))))
+
 (deftest agent-new-command-resolves-explicit-and-default-route
   (with-isolated-data
     (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))

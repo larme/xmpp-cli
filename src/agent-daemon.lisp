@@ -148,6 +148,20 @@
   (and (plusp (length text))
        (char= (char text 0) #\/)))
 
+(defun route-code-character-p (char)
+  (or (and (char>= char #\a)
+           (char<= char #\z))
+      (and (char>= char #\A)
+           (char<= char #\Z))))
+
+(defun route-code-token-p (state token)
+  (let ((code-length (getf (daemon-state-agent-config state)
+                           :code-length
+                           4)))
+    (and (stringp token)
+         (= (length token) code-length)
+         (every #'route-code-character-p token))))
+
 (defun active-routes-for-state (state)
   (load-active-routes :route-ttl-days (route-ttl-days state)))
 
@@ -164,9 +178,11 @@
                                                          ttl-days))))
             (if explicit-route
                 (values explicit-route candidate-text nil)
-                (let ((default-route (last-active-route routes)))
-                  (when default-route
-                    (values default-route message t))))))))))
+                (if (route-code-token-p state candidate-code)
+                    (values nil nil nil candidate-code)
+                    (let ((default-route (last-active-route routes)))
+                      (when default-route
+                        (values default-route message t)))))))))))
 
 (defun route-reply-success-message (route text default-route-p)
   (let ((suffix (if default-route-p " (default route)" "")))
@@ -192,14 +208,22 @@
                condition)))))
 
 (defun handle-route-reply (state from body)
-  (multiple-value-bind (route text default-route-p)
+  (multiple-value-bind (route text default-route-p unknown-route-code)
       (resolve-route-reply state body)
-    (if route
-        (handle-resolved-route-reply state from route text default-route-p)
-        (send-daemon-note
-         state
-         from
-         "xmpp-cli: no active route; wait for a Codex notification or prepend a route code."))))
+    (cond
+      (route
+       (handle-resolved-route-reply state from route text default-route-p))
+      (unknown-route-code
+       (send-daemon-note
+        state
+        from
+        (format nil "xmpp-cli: route code ~a is unknown or stale; wait for a new Codex notification or use a current route code."
+                unknown-route-code)))
+      (t
+       (send-daemon-note
+        state
+        from
+        "xmpp-cli: no active route; wait for a Codex notification or prepend a route code.")))))
 
 (defun parse-agent-command (body)
   (let ((text (reply-text body)))
