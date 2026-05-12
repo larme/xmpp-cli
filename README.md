@@ -25,7 +25,7 @@ DELIVERY_LEVEL=0 ./scripts/build.sh   # largest, keeps delivered debug support b
 DELIVERY_LEVEL=3 ./scripts/build.sh   # smaller, needs runtime testing
 ```
 
-Set `DELIVERY_DEBUG=1` when you need LispWorks delivered-image debugger support at a higher delivery level, or `DELIVERY_DEBUG=0` to force it off for a level `0` build. The delivery script keeps LispWorks reader and pretty-printer support because runtime config/history loading uses `read` and XMPP error paths may print XML objects. Do not run `strip` on the delivered executable; it removes the LispWorks image trailer and corrupts the binary.
+Set `DELIVERY_DEBUG=1` when you need LispWorks delivered-image debugger support at a higher delivery level, or `DELIVERY_DEBUG=0` to force it off for a level `0` build. The delivery script keeps LispWorks reader and pretty-printer support because the daemon IPC uses a small local S-expression protocol and XMPP error paths may print XML objects. Do not run `strip` on the delivered executable; it removes the LispWorks image trailer and corrupts the binary.
 
 ## Usage
 
@@ -55,7 +55,54 @@ Send UTF-8 text file contents as the message body:
 ./build/xmpp-cli send friend@example.org -f ./message.txt
 ```
 
+When the agent daemon is running, `send` first asks the daemon to send through
+its persistent XMPP connection. If the daemon is absent, stale, or not
+connected, `send` falls back to the standalone one-shot connection.
+
 `send -f` does not send a binary attachment. True file upload is a future feature and should use XEP-0363 HTTP File Upload.
+
+## Agent Daemon
+
+Configure the notification and reply account:
+
+```sh
+./build/xmpp-cli agent config set-notify-to larme@example.org
+```
+
+`set-notify-to` also allows that JID as a reply sender when the sender list is
+empty. Additional senders can be managed with:
+
+```sh
+./build/xmpp-cli agent config allow-sender other@example.org
+./build/xmpp-cli agent config remove-sender other@example.org
+```
+
+Start the daemon in a tmux window or a service wrapper:
+
+```sh
+./build/xmpp-cli agent daemon --foreground
+```
+
+Check and stop it with:
+
+```sh
+./build/xmpp-cli agent status
+./build/xmpp-cli agent stop
+```
+
+Codex notifications include a four-letter lowercase route code. Reply with
+only the code to focus that tmux pane:
+
+```text
+abcd
+```
+
+Reply with the code plus text to focus the pane, paste the text into the
+agent, and press Enter:
+
+```text
+abcd please rerun the failing test
+```
 
 ## State
 
@@ -68,8 +115,12 @@ $HOME/.local/xmpp-cli/
 Files:
 
 ```text
-config.sexp
-history.sexp
+config.yaml
+history.yaml
+agent/config.yaml
+agent/routes.yaml
+agent/control.yaml
+agent/tmp/
 logs/
 ```
 
@@ -100,13 +151,17 @@ You can also supply the recipient through the environment:
 CODEX_XMPP_NOTIFY_TO=you@example.org ./scripts/install-codex-xmpp-hook.sh
 ```
 
-The installer copies `codex-hooks/xmpp-notify.py` into
-`$CODEX_HOME/hooks/` or `~/.codex/hooks/`, enables Codex hooks, and registers
-`Stop` plus `PermissionRequest` hooks in `config.toml`. The recipient is stored
-in `xmpp-notify.env` beside the installed hook, not in the hook source or Codex
-config. At runtime, `CODEX_XMPP_NOTIFY_TO` overrides that file. Notification
-headers include the event, hostname, Git repository root, current working
-directory, and tool name when Codex is waiting for approval.
+The installer stores the recipient in
+`~/.local/xmpp-cli/agent/config.yaml`, enables Codex hooks, and registers
+`Stop` plus `PermissionRequest` hooks in `config.toml` using:
+
+```sh
+xmpp-cli agent notify-codex
+```
+
+Notification headers include the route code, event, hostname, repository
+location, current working directory, and tool name when Codex is waiting for
+approval.
 
 ## Tests
 

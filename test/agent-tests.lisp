@@ -107,12 +107,34 @@
             (third (xmpp-cli/json:json-value payload "items")))
            "JSON null should round-trip as the internal null marker.")))
 
+(deftest stream-and-yaml-preserve-unicode
+  (let* ((text (format nil "I~Cm fine" (code-char #x2019)))
+         (yaml (xmpp-cli/yaml:emit-yaml
+                (list (cons "message" text)))))
+    (check-equal text
+                 (with-input-from-string (in text)
+                   (xmpp-cli/util:read-stream-as-string in)))
+    (check-equal text
+                 (xmpp-cli/yaml:yaml-value
+                  (xmpp-cli/yaml:parse-yaml yaml)
+                  "message"))))
+
+(deftest tmux-format-strings-use-real-tabs
+  (check (search (string #\Tab) xmpp-cli/tmux::*tmux-display-format*)
+         "tmux display format should contain real tab separators")
+  (check (search (string #\Tab) xmpp-cli/tmux::*tmux-pane-location-format*)
+         "tmux pane location format should contain real tab separators")
+  (check (search (string #\Tab) xmpp-cli/tmux::*tmux-client-format*)
+         "tmux client format should contain real tab separators"))
+
 (deftest tmux-display-line-parses-stable-ids
   (let ((context (xmpp-cli/tmux::parse-tmux-display-line
-                  "$1	session	@3	0	editor	%12	1	/home/larme/codes/cl-projects/xmpp-cli
+                  "/dev/pts/45	/dev/pts/45	$1	session	@3	0	editor	%12	1	/home/larme/codes/cl-projects/xmpp-cli
 "
                   "/tmp/tmux-1000/default,123,0")))
     (check-equal "/tmp/tmux-1000/default" (getf context :tmux-socket))
+    (check-equal "/dev/pts/45" (getf context :tmux-client-name))
+    (check-equal "/dev/pts/45" (getf context :tmux-client-tty))
     (check-equal "$1" (getf context :tmux-session-id))
     (check-equal "@3" (getf context :tmux-window-id))
     (check-equal "%12" (getf context :tmux-pane-id))))
@@ -123,6 +145,35 @@
                   "%57")))
     (check-equal "/tmp/tmux-1000/default" (getf context :tmux-socket))
     (check-equal "%57" (getf context :tmux-pane-id))))
+
+(deftest tmux-pane-location-parses-window-id
+  (let ((location (xmpp-cli/tmux::parse-tmux-pane-location-line
+                   "/dev/pts/45	/dev/pts/45	$6	@98
+")))
+    (check-equal "/dev/pts/45" (getf location :tmux-client-name))
+    (check-equal "$6" (getf location :tmux-session-id))
+    (check-equal "@98" (getf location :tmux-window-id))))
+
+(deftest tmux-client-line-parses-client-name
+  (let ((client (xmpp-cli/tmux::parse-tmux-client-line
+                 "/dev/pts/45	$6
+")))
+    (check-equal "/dev/pts/45" (getf client :tmux-client-name))
+    (check-equal "$6" (getf client :tmux-session-id))))
+
+(deftest agent-reply-parser-is-case-insensitive
+  (multiple-value-bind (code text)
+      (xmpp-cli/agent-daemon:parse-agent-reply
+       "  AbCd please rerun the failing test  ")
+    (check-equal "abcd" code)
+    (check-equal "please rerun the failing test" text))
+  (multiple-value-bind (code text)
+      (xmpp-cli/agent-daemon:parse-agent-reply "ABCD")
+    (check-equal "abcd" code)
+    (check-equal "" text))
+  (check-equal "user@example.org"
+               (xmpp-cli/agent-daemon:bare-jid
+                "user@example.org/phone")))
 
 (deftest codex-notification-allocates-route-code
   (with-isolated-data
@@ -135,6 +186,8 @@
                              "{\"hook_event_name\":\"Stop\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"session_id\":\"session-1\",\"cwd\":\"~a\",\"last_assistant_message\":\"done\"}"
                              cwd)))
            (context (list :tmux-socket "/tmp/tmux-1000/default"
+                          :tmux-client-name "/dev/pts/45"
+                          :tmux-client-tty "/dev/pts/45"
                           :tmux-session-id "$1"
                           :tmux-window-id "@3"
                           :tmux-pane-id "%12"))
@@ -164,6 +217,7 @@
       (check (search (format nil "~a hbox " code)
                      (xmpp-cli/agent-codex:notification-body notification-a))
              "notification body should start with the route code and host")
+      (check-equal "/dev/pts/45" (getf route-a :tmux-client-name))
       (check-equal code (getf route-b :code)))))
 
 (deftest codex-notification-routes-with-env-only-tmux-context
@@ -209,6 +263,27 @@
         (check-equal "friend@example.org" to)
         (check (search "codex finished" body)
                "notification body should summarize the Codex event")))))
+
+(deftest cli-agent-notify-codex-sends-unicode-message
+  (with-isolated-data
+    (save-default-test-profile)
+    (xmpp-cli/agent-config:save-agent-config
+     (xmpp-cli/agent-config:set-notify-to
+      (xmpp-cli/agent-config:load-agent-config)
+      "friend@example.org"))
+    (let ((payload (format nil
+                           "{\"hook_event_name\":\"Stop\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"cwd\":\"/tmp\",\"last_assistant_message\":\"I~Cm fine\"}"
+                           (code-char #x2019))))
+      (multiple-value-bind (code events output error-output)
+          (run-cli '("agent" "notify-codex") :input payload)
+        (declare (ignore output error-output))
+        (check-equal 0 code)
+        (check-equal 1 (length events))
+        (destructuring-bind (event profile to body) (first events)
+          (declare (ignore profile to))
+          (check-equal :send-text event)
+          (check (search (format nil "I~Cm fine" (code-char #x2019)) body)
+                 "notification body should preserve Unicode punctuation"))))))
 
 (deftest cli-agent-notify-codex-missing-profile-is-best-effort
   (with-isolated-data

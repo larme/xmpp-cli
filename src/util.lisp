@@ -47,7 +47,7 @@
     (read-stream-as-string in)))
 
 (defun read-stream-as-string (stream)
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (loop for ch = (read-char stream nil nil)
           while ch
           do (write-char ch out))))

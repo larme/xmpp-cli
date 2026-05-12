@@ -119,14 +119,16 @@
    #:load-routes
    #:save-routes
    #:ensure-route
-   #:find-route-by-code))
+   #:find-route-by-code
+   #:mark-route-used))
 
 (defpackage #:xmpp-cli/tmux
   (:use #:cl)
   (:import-from #:xmpp-cli/util
                 #:home-xmpp-cli-directory
                 #:ensure-private-directory
-                #:write-private-file)
+                #:write-private-file
+                #:read-file-as-string)
   (:export
    #:capture-context
    #:context-available-p
@@ -162,13 +164,82 @@
   (:use #:cl)
   (:export
    #:send-text
-   #:check-login))
+   #:check-login
+   #:call-with-connection
+   #:send-connected-text
+   #:receive-connected-message-loop
+   #:close-connection))
+
+(defpackage #:xmpp-cli/agent-ipc
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:ensure-private-directory
+                #:now-iso8601)
+  (:import-from #:xmpp-cli/yaml
+                #:read-yaml-file
+                #:write-yaml-file
+                #:yaml-value)
+  (:import-from #:xmpp-cli/agent-config
+                #:agent-directory)
+  (:export
+   #:control-pathname
+   #:load-control
+   #:save-control
+   #:delete-control
+   #:make-control-token
+   #:read-ipc-message
+   #:write-ipc-message
+   #:make-ipc-stream
+   #:request-control
+   #:daemon-send
+   #:daemon-status
+   #:daemon-stop))
+
+(defpackage #:xmpp-cli/agent-daemon
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:now-iso8601)
+  (:import-from #:xmpp-cli/state
+                #:load-config
+                #:profile)
+  (:import-from #:xmpp-cli/agent-config
+                #:load-agent-config
+                #:allowed-senders)
+  (:import-from #:xmpp-cli/agent-routes
+                #:load-routes
+                #:find-route-by-code
+                #:mark-route-used)
+  (:import-from #:xmpp-cli/tmux
+                #:focus-pane
+                #:paste-text-and-enter)
+  (:import-from #:xmpp-cli/backend
+                #:call-with-connection
+                #:send-connected-text
+                #:receive-connected-message-loop
+                #:close-connection)
+  (:import-from #:xmpp-cli/agent-ipc
+                #:load-control
+                #:save-control
+                #:delete-control
+                #:make-control-token
+                #:read-ipc-message
+                #:write-ipc-message
+                #:make-ipc-stream
+                #:daemon-status)
+  (:export
+   #:run-daemon
+   #:parse-agent-reply
+   #:bare-jid))
 
 (defpackage #:xmpp-cli/backend/cl-xmpp
   (:use #:cl)
   (:import-from #:xmpp-cli/backend
                 #:send-text
-                #:check-login)
+                #:check-login
+                #:call-with-connection
+                #:send-connected-text
+                #:receive-connected-message-loop
+                #:close-connection)
   (:export
    #:make-backend))
 
@@ -205,6 +276,17 @@
                 #:json-compact-string)
   (:import-from #:xmpp-cli/yaml
                 #:emit-yaml)
+  (:import-from #:xmpp-cli/agent-ipc
+                #:daemon-send
+                #:daemon-status
+                #:daemon-stop)
+  (:import-from #:xmpp-cli/agent-routes
+                #:load-routes
+                #:find-route-by-code)
+  (:import-from #:xmpp-cli/tmux
+                #:focus-pane)
+  (:import-from #:xmpp-cli/agent-daemon
+                #:run-daemon)
   (:import-from #:xmpp-cli/backend
                 #:check-login
                 #:send-text)

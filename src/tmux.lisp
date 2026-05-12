@@ -1,7 +1,37 @@
 (in-package #:xmpp-cli/tmux)
 
+(defun tab-joined-format (&rest fields)
+  (with-output-to-string (out)
+    (loop for field in fields
+          for first = t then nil
+          do (progn
+               (unless first
+                 (write-char #\Tab out))
+               (write-string field out)))))
+
 (defparameter *tmux-display-format*
-  "#{session_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_index}\t#{pane_current_path}")
+  (tab-joined-format "#{client_name}"
+                     "#{client_tty}"
+                     "#{session_id}"
+                     "#{session_name}"
+                     "#{window_id}"
+                     "#{window_index}"
+                     "#{window_name}"
+                     "#{pane_id}"
+                     "#{pane_index}"
+                     "#{pane_current_path}"))
+
+(defparameter *tmux-pane-location-format*
+  (tab-joined-format "#{client_name}"
+                     "#{client_tty}"
+                     "#{session_id}"
+                     "#{window_id}"))
+
+(defparameter *tmux-client-format*
+  (tab-joined-format "#{client_name}"
+                     "#{session_id}"))
+
+(defparameter *post-paste-enter-delay* 0.25)
 
 (defun split-string (string delimiter)
   (let ((parts nil)
@@ -20,10 +50,97 @@
 (defun trim-line-end (string)
   (string-right-trim '(#\Newline #\Return #\Space #\Tab) string))
 
+(defun non-empty-lines (string)
+  (remove "" (split-string (trim-line-end string) #\Newline) :test #'string=))
+
+(defvar *tmux-executable* nil)
+
+(defun slash-suffixed (directory)
+  (if (and (plusp (length directory))
+           (char= (char directory (1- (length directory))) #\/))
+      directory
+      (concatenate 'string directory "/")))
+
+(defun executable-candidates (name)
+  (let* ((path (or (uiop:getenv "PATH") ""))
+         (path-directories (remove "" (split-string path #\:) :test #'string=)))
+    (if (position #\/ name)
+        (list name)
+        (remove-duplicates
+         (append (mapcar (lambda (directory)
+                           (concatenate 'string (slash-suffixed directory) name))
+                         path-directories)
+                 (list (concatenate 'string "/usr/bin/" name)
+                       (concatenate 'string "/bin/" name)
+                       (concatenate 'string "/usr/local/bin/" name)))
+         :test #'string=))))
+
+(defun find-executable (name)
+  (loop for candidate in (executable-candidates name)
+        for truename = (probe-file candidate)
+        when truename
+          return (namestring truename)))
+
+(defun tmux-executable ()
+  (or *tmux-executable*
+      (setf *tmux-executable*
+            (or (find-executable "tmux")
+                (error "tmux executable was not found in PATH or common locations.")))))
+
+(defun tmux-command (arguments socket)
+  (append (list (tmux-executable))
+          (when socket (list "-S" socket))
+          arguments))
+
+#+lispworks
+(defun lispworks-temp-output-pathname ()
+  (merge-pathnames
+   (format nil "xmpp-cli-tmux-~36r-~36r.out"
+           (get-universal-time)
+           (random 1000000000))
+   (uiop:temporary-directory)))
+
+;; Do not use UIOP:RUN-PROGRAM for tmux in delivered LispWorks images.
+;; We hit a delivery-only failure where UIOP's LispWorks subprocess path
+;; referenced SYSTEM:PIPE-EXIT-STATUS after delivery had removed or hidden it.
+;; Keeping the LispWorks-specific process boundary here also lets us control
+;; UTF-8 character output and exact exit-status handling.
+#+lispworks
+(defun run-command-lispworks (command capture-output)
+  (let ((output-file (and capture-output (lispworks-temp-output-pathname))))
+    (unwind-protect
+         (multiple-value-bind (exit-status signal-number)
+             (funcall (find-symbol "RUN-SHELL-COMMAND" "SYSTEM")
+                      command
+                      :wait t
+                      :output (or output-file nil)
+                      :error-output nil
+                      :if-output-exists :supersede
+                      :element-type 'character
+                      :external-format :utf-8)
+           (cond
+             ((and exit-status (zerop exit-status) (null signal-number))
+              (if output-file
+                  (read-file-as-string output-file)
+                  ""))
+             (signal-number
+              (error "tmux command was terminated by signal ~d: ~{~a~^ ~}"
+                     signal-number
+                     command))
+             (t
+              (error "tmux command exited with status ~a: ~{~a~^ ~}"
+                     exit-status
+                     command))))
+      (when output-file
+        (ignore-errors
+          (delete-file output-file))))))
+
 (defun parse-tmux-display-line (line tmux-env)
   (let ((parts (split-string (trim-line-end line) #\Tab)))
-    (when (= (length parts) 8)
-      (destructuring-bind (session-id
+    (when (= (length parts) 10)
+      (destructuring-bind (client-name
+                           client-tty
+                           session-id
                            session-name
                            window-id
                            window-index
@@ -33,6 +150,8 @@
                            pane-current-path)
           parts
         (list :tmux-socket (first-tmux-field tmux-env)
+              :tmux-client-name client-name
+              :tmux-client-tty client-tty
               :tmux-session-id session-id
               :tmux-session-name session-name
               :tmux-window-id window-id
@@ -42,19 +161,43 @@
               :tmux-pane-index pane-index
               :tmux-pane-current-path pane-current-path)))))
 
+(defun parse-tmux-pane-location-line (line)
+  (let ((parts (split-string (trim-line-end line) #\Tab)))
+    (cond
+      ((= (length parts) 4)
+       (destructuring-bind (client-name client-tty session-id window-id) parts
+         (list :tmux-client-name client-name
+               :tmux-client-tty client-tty
+               :tmux-session-id session-id
+               :tmux-window-id window-id)))
+      ((= (length parts) 2)
+       (destructuring-bind (session-id window-id) parts
+         (list :tmux-session-id session-id
+               :tmux-window-id window-id))))))
+
+(defun parse-tmux-client-line (line)
+  (let ((parts (split-string (trim-line-end line) #\Tab)))
+    (when (= (length parts) 2)
+      (destructuring-bind (client-name session-id) parts
+        (list :tmux-client-name client-name
+              :tmux-session-id session-id)))))
+
 (defun fallback-tmux-context (tmux-env pane)
   (when (and tmux-env pane)
     (list :tmux-socket (first-tmux-field tmux-env)
           :tmux-pane-id pane)))
 
 (defun run-tmux (arguments &key input socket)
-  (uiop:run-program (append (list "tmux")
-                            (when socket (list "-S" socket))
-                            arguments)
-                    :input (or input nil)
-                    :output :string
-                    :error-output nil
-                    :ignore-error-status t))
+  (declare (ignore input))
+  (let ((command (tmux-command arguments socket)))
+    ;; Non-LispWorks implementations keep the portable UIOP path. LispWorks
+    ;; delivery uses RUN-COMMAND-LISPWORKS for the reasons documented above.
+    #+lispworks
+    (run-command-lispworks command t)
+    #-lispworks
+    (uiop:run-program command
+                      :output :string
+                      :error-output nil)))
 
 (defun capture-context ()
   (let ((tmux-env (uiop:getenv "TMUX"))
@@ -77,15 +220,78 @@
        (getf context :tmux-socket)
        (getf context :tmux-pane-id)))
 
+(defun pane-location (pane-id socket)
+  (parse-tmux-pane-location-line
+   (run-tmux (list "display-message"
+                   "-p"
+                   "-t"
+                   pane-id
+                   *tmux-pane-location-format*)
+             :socket socket)))
+
+(defun list-clients (&key session-id socket)
+  (handler-case
+      (let ((arguments (append (list "list-clients")
+                               (when session-id
+                                 (list "-t" session-id))
+                               (list "-F" *tmux-client-format*))))
+        (loop for line in (non-empty-lines (run-tmux arguments :socket socket))
+              for client = (parse-tmux-client-line line)
+              when client
+                collect client))
+    (error ()
+      nil)))
+
+(defun client-names (&key session-id socket)
+  (remove-duplicates
+   (loop for client in (list-clients :session-id session-id :socket socket)
+         for client-name = (getf client :tmux-client-name)
+         when (and client-name (plusp (length client-name)))
+           collect client-name)
+   :test #'string=))
+
+(defun target-client-names (route location session-id socket)
+  (let ((stored-client (getf route :tmux-client-name))
+        (location-client (getf location :tmux-client-name)))
+    (cond
+      ((and stored-client
+            (member stored-client (client-names :socket socket) :test #'string=))
+       (list stored-client))
+      ((and location-client
+            (plusp (length location-client)))
+       (list location-client))
+      (session-id
+       (client-names :session-id session-id :socket socket))
+      (t
+       nil))))
+
+(defun select-pane-location (pane-id window-id socket)
+  (when window-id
+    (run-tmux (list "select-window" "-t" window-id) :socket socket))
+  (run-tmux (list "select-pane" "-t" pane-id) :socket socket))
+
+(defun focus-client (client-name session-id pane-id window-id socket)
+  (declare (ignore session-id window-id))
+  (when (and client-name pane-id)
+    (run-tmux (list "switch-client" "-c" client-name "-t" pane-id)
+              :socket socket))
+  t)
+
 (defun focus-pane (route)
   (let ((socket (getf route :tmux-socket))
+        (session-id (getf route :tmux-session-id))
         (window-id (getf route :tmux-window-id))
-        (pane-id (getf route :tmux-pane-id)))
+        (pane-id (getf route :tmux-pane-id))
+        (location nil))
     (unless pane-id
       (error "Route does not include a tmux pane target."))
-    (when window-id
-      (run-tmux (list "select-window" "-t" window-id) :socket socket))
-    (run-tmux (list "select-pane" "-t" pane-id) :socket socket)
+    (unless (and session-id window-id)
+      (setf location (pane-location pane-id socket))
+      (setf session-id (or session-id (getf location :tmux-session-id)))
+      (setf window-id (getf location :tmux-window-id)))
+    (select-pane-location pane-id window-id socket)
+    (dolist (client-name (target-client-names route location session-id socket))
+      (focus-client client-name session-id pane-id window-id socket))
     t))
 
 (defun agent-tmp-directory ()
@@ -113,9 +319,10 @@
            (write-private-file temp text)
            (run-tmux (list "load-buffer" "-b" buffer-name (namestring temp))
                      :socket (getf route :tmux-socket))
-           (run-tmux (list "paste-buffer" "-d" "-b" buffer-name "-t" pane-id)
+           (run-tmux (list "paste-buffer" "-p" "-d" "-b" buffer-name "-t" pane-id)
                      :socket (getf route :tmux-socket))
-           (run-tmux (list "send-keys" "-t" pane-id "Enter")
+           (sleep *post-paste-enter-delay*)
+           (run-tmux (list "send-keys" "-t" pane-id "C-m")
                      :socket (getf route :tmux-socket))
            t)
       (ignore-errors

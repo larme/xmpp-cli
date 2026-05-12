@@ -143,6 +143,8 @@
                                 cwd
                                 display-cwd
                                 tmux-socket
+                                tmux-client-name
+                                tmux-client-tty
                                 tmux-session-id
                                 tmux-window-id
                                 tmux-pane-id)
@@ -156,6 +158,8 @@
                          :cwd cwd
                          :display-cwd display-cwd
                          :tmux-socket tmux-socket
+                         :tmux-client-name tmux-client-name
+                         :tmux-client-tty tmux-client-tty
                          :tmux-session-id tmux-session-id
                          :tmux-window-id tmux-window-id
                          :tmux-pane-id tmux-pane-id)))
@@ -169,3 +173,16 @@
                (new-routes (cons route routes)))
           (save-routes new-routes)
           (values route new-routes t)))))
+
+(defun mark-route-used (route &optional (now (now-iso8601)))
+  (let* ((routes (load-routes))
+         (route-id (getf route :route-id))
+         (existing (and route-id (find-route-by-id routes route-id))))
+    (unless existing
+      (error "Route no longer exists for code ~a." (getf route :code)))
+    (let* ((updated (copy-list existing))
+           (new-routes nil))
+      (setf (getf updated :last-used-at) now)
+      (setf new-routes (cons updated (remove existing routes :test #'eq)))
+      (save-routes new-routes)
+      updated)))

@@ -70,7 +70,7 @@
                (char= (char text 0) #\")
                (char= (char text (1- (length text))) #\"))
     (error "Malformed YAML double-quoted scalar: ~a" text))
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (let ((escaped nil))
       (loop for index from 1 below (1- (length text))
             for char = (char text index)
@@ -99,7 +99,7 @@
                (char= (char text 0) #\')
                (char= (char text (1- (length text))) #\'))
     (error "Malformed YAML single-quoted scalar: ~a" text))
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (let ((index 1))
       (loop while (< index (1- (length text)))
             for char = (char text index)
@@ -290,7 +290,7 @@
        (not (yaml-alist-p value))))
 
 (defun escape-yaml-string (string)
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (write-char #\" out)
     (loop for char across string
           do (case char
@@ -372,7 +372,7 @@
        (format stream "- ~a~%" (emit-scalar item))))))
 
 (defun emit-yaml (value)
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (cond
       ((yaml-alist-p value)
        (emit-mapping out value 0))

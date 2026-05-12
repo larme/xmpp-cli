@@ -144,6 +144,8 @@
                         :cwd cwd
                         :display-cwd display-cwd
                         :tmux-socket (getf context :tmux-socket)
+                        :tmux-client-name (getf context :tmux-client-name)
+                        :tmux-client-tty (getf context :tmux-client-tty)
                         :tmux-session-id (getf context :tmux-session-id)
                         :tmux-window-id (getf context :tmux-window-id)
                         :tmux-pane-id (getf context :tmux-pane-id))

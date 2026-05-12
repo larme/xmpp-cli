@@ -89,7 +89,7 @@
     (deliver entry-point
              output
              level
-             :multiprocessing nil
+             :multiprocessing t
              :keep-debug-mode debug-p
              :keep-stub-functions debug-p
              :keep-function-name (if debug-p t :minimal)

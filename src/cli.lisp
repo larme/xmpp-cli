@@ -160,6 +160,31 @@
               condition)
       nil)))
 
+(defun daemon-compatible-profile-p (profile-name)
+  (handler-case
+      (let ((agent-profile (getf (load-agent-config) :profile "default")))
+        (string= profile-name agent-profile))
+    (error ()
+      nil)))
+
+(defun send-message-with-fallback (profile-name profile-plist recipient body)
+  "Return TRANSPORT and ERROR. TRANSPORT is :DAEMON or :STANDALONE on success."
+  (when (daemon-compatible-profile-p profile-name)
+    (multiple-value-bind (ok response error) (daemon-send recipient body)
+      (declare (ignore response error))
+      (when ok
+        (return-from send-message-with-fallback (values :daemon nil)))))
+  (let ((send-error
+          (handler-case
+              (progn
+                (send-text (funcall *backend-factory*) profile-plist recipient body)
+                nil)
+            (error (condition)
+              condition))))
+    (if send-error
+        (values nil send-error)
+        (values :standalone nil))))
+
 (defun handle-send (cmd)
   (let* ((args (clingon:command-arguments cmd))
          (recipient (first args))
@@ -178,13 +203,8 @@
         (fail +exit-missing-profile+
               "No auth/profile data found for profile ~a. Run xmpp-cli login first."
               profile-name))
-      (let ((send-error
-              (handler-case
-                  (progn
-                    (send-text (funcall *backend-factory*) profile-plist recipient body)
-                    nil)
-                (error (condition)
-                  condition))))
+      (multiple-value-bind (transport send-error)
+          (send-message-with-fallback profile-name profile-plist recipient body)
         (if send-error
             (progn
               (ignore-errors
@@ -198,7 +218,10 @@
               +exit-xmpp+)
             (progn
               (maybe-append-send-history profile-name recipient kind body :sent)
-              (format t "sent to ~a using profile ~a~%" recipient profile-name)
+              (format t "sent to ~a using profile ~a~@[ via daemon~]~%"
+                      recipient
+                      profile-name
+                      (eq transport :daemon))
               +exit-success+))))))
 
 (defun handle-agent-config-show (cmd)
@@ -276,13 +299,11 @@
                       condition)))))
              (target (notification-target notification))
              (body (notification-body notification))
-             (send-error
-               (handler-case
-                   (progn
-                     (send-text (funcall *backend-factory*) profile-plist target body)
-                     nil)
-                 (error (condition)
-                   condition))))
+             (send-error nil))
+        (multiple-value-bind (transport error)
+            (send-message-with-fallback profile-name profile-plist target body)
+          (declare (ignore transport))
+          (setf send-error error))
         (if send-error
             (progn
               (ignore-errors
@@ -302,6 +323,64 @@
                                          body
                                          :sent)
               +exit-success+))))))
+
+(defun handle-agent-daemon (cmd)
+  (declare (ignore cmd))
+  (run-daemon (funcall *backend-factory*)))
+
+(defun handle-agent-status (cmd)
+  (declare (ignore cmd))
+  (multiple-value-bind (ok response error) (daemon-status)
+    (cond
+      (ok
+       (format t "daemon: running~%")
+       (format t "profile: ~a~%" (getf response :profile))
+       (format t "control: ~a:~a~%"
+               (getf response :control-host)
+               (getf response :control-port))
+       (format t "xmpp: ~(~a~)~%" (getf response :xmpp-status))
+       (when (getf response :connected-at)
+         (format t "connected_at: ~a~%" (getf response :connected-at)))
+       (when (getf response :last-error)
+         (format t "last_error: ~a~%" (getf response :last-error)))
+       (when (getf response :route-count)
+         (format t "routes: ~d~%" (getf response :route-count)))
+       +exit-success+)
+      (t
+       (if (and error (not (eq error :no-control)))
+           (format *error-output* "daemon: not running (~a)~%" error)
+           (format *error-output* "daemon: not running~%"))
+       +exit-general+))))
+
+(defun handle-agent-stop (cmd)
+  (declare (ignore cmd))
+  (multiple-value-bind (ok response error) (daemon-stop)
+    (declare (ignore response))
+    (if ok
+        (progn
+          (format t "daemon: stop requested~%")
+          +exit-success+)
+        (progn
+          (if (and error (not (eq error :no-control)))
+              (format *error-output* "daemon: not stopped (~a)~%" error)
+              (format *error-output* "daemon: not stopped~%"))
+          +exit-general+))))
+
+(defun handle-agent-focus (cmd)
+  (let ((args (clingon:command-arguments cmd)))
+    (unless (= (length args) 1)
+      (command-usage-error cmd "Usage: xmpp-cli agent focus <route-code>"))
+    (let* ((code (string-downcase (first args)))
+           (route (find-route-by-code code (load-routes))))
+      (unless route
+        (fail +exit-usage+ "Unknown route code: ~a" code))
+      (handler-case
+          (progn
+            (focus-pane route)
+            (format t "focused ~a~%" code)
+            +exit-success+)
+        (error (condition)
+          (fail +exit-general+ "focus failed for ~a: ~a" code condition))))))
 
 (defun login-command ()
   (clingon:make-command
@@ -366,11 +445,44 @@
                        (agent-config-allow-sender-command)
                        (agent-config-remove-sender-command))))
 
+(defun agent-daemon-options ()
+  (list
+   (clingon:make-option :flag
+                        :long-name "foreground"
+                        :description "Run in the foreground"
+                        :key :foreground)))
+
+(defun agent-daemon-command ()
+  (clingon:make-command
+   :name "daemon"
+   :description "run the XMPP agent bridge daemon in the foreground"
+   :options (agent-daemon-options)
+   :handler #'handle-agent-daemon))
+
+(defun agent-status-command ()
+  (clingon:make-command
+   :name "status"
+   :description "show XMPP agent bridge daemon status"
+   :handler #'handle-agent-status))
+
+(defun agent-stop-command ()
+  (clingon:make-command
+   :name "stop"
+   :description "stop the running XMPP agent bridge daemon"
+   :handler #'handle-agent-stop))
+
 (defun agent-notify-codex-command ()
   (clingon:make-command
    :name "notify-codex"
    :description "send a route-coded XMPP notification from a Codex hook payload"
    :handler #'handle-agent-notify-codex))
+
+(defun agent-focus-command ()
+  (clingon:make-command
+   :name "focus"
+   :description "focus a tmux route by code"
+   :usage "<route-code>"
+   :handler #'handle-agent-focus))
 
 (defun agent-handler (cmd)
   (clingon:print-usage cmd t)
@@ -382,7 +494,11 @@
    :description "manage XMPP agent bridge features"
    :handler #'agent-handler
    :sub-commands (list (agent-config-command)
-                       (agent-notify-codex-command))))
+                       (agent-daemon-command)
+                       (agent-status-command)
+                       (agent-stop-command)
+                       (agent-notify-codex-command)
+                       (agent-focus-command))))
 
 (defun top-level-handler (cmd)
   (clingon:print-usage cmd t)

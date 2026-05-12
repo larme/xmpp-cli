@@ -12,7 +12,10 @@
                "cl-xmpp/tls"
                "cl-scram"
                "com.inuoe.jzon"
+               "bordeaux-threads"
+               "flexi-streams"
                "ironclad"
+               "usocket"
                "uiop")
   :serial t
   :components
@@ -30,6 +33,8 @@
      (:file "tmux")
      (:file "agent-codex")
      (:file "xmpp-backend")
+     (:file "agent-ipc")
+     (:file "agent-daemon")
      (:file "xmpp-cl-xmpp")
      (:file "cli")
      (:file "main")))))

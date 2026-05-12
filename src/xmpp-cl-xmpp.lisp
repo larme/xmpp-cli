@@ -47,7 +47,7 @@
        (string= prefix string :end2 (length prefix))))
 
 (defun scram-sasl-name (name)
-  (with-output-to-string (out)
+  (with-output-to-string (out nil :element-type 'character)
     (loop for char across name
           do (case char
                (#\, (write-string "=2C" out))
@@ -276,19 +276,23 @@
                   advertised)))
        (canonical-sasl-mechanism mechanism)))))
 
-(defmacro with-cl-xmpp-connection ((connection profile &key (send-presence nil)) &body body)
+(defmacro with-cl-xmpp-connection ((connection profile &key
+                                               (send-presence nil)
+                                               resource)
+                                   &body body)
   `(call-with-cl-xmpp-connection
     ,profile
     (lambda (,connection) ,@body)
-    :send-presence ,send-presence))
+    :send-presence ,send-presence
+    :resource ,resource))
 
-(defun call-with-cl-xmpp-connection (profile thunk &key send-presence)
+(defun call-with-cl-xmpp-connection (profile thunk &key send-presence resource)
   (let* ((username (required profile :username))
          (password (required profile :password))
          (domain (required profile :domain))
          (host (or (getf profile :host) domain))
          (port (or (getf profile :port) 5222))
-         (resource (or (getf profile :resource) "xmpp-cli"))
+         (resource (or resource (getf profile :resource) "xmpp-cli"))
          (mechanism (or (getf profile :mechanism) :auto))
          (connection nil))
     (let ((xmpp:*debug-stream* nil))
@@ -323,8 +327,49 @@
     (declare (ignore connection))
     t))
 
-(defmethod send-text ((backend cl-xmpp-backend) profile to body)
+(defmethod call-with-connection ((backend cl-xmpp-backend)
+                                 profile
+                                 function
+                                 &key
+                                   resource
+                                   send-presence)
   (declare (ignore backend))
-  (with-cl-xmpp-connection (connection profile :send-presence nil)
-    (xmpp:message connection to body :type :chat)
-    :sent))
+  (call-with-cl-xmpp-connection profile
+                                function
+                                :resource resource
+                                :send-presence send-presence))
+
+(defmethod send-connected-text ((backend cl-xmpp-backend) connection to body)
+  (declare (ignore backend))
+  (xmpp:message connection to body :type :chat)
+  :sent)
+
+(defmethod receive-connected-message-loop ((backend cl-xmpp-backend)
+                                           connection
+                                           handler)
+  (declare (ignore backend))
+  (loop for event = (xmpp:receive-stanza connection)
+        do (when (typep event 'xmpp:message)
+             (let ((body (xmpp:body event)))
+               (when (and body (plusp (length body)))
+                 (funcall handler
+                          (list :from (xmpp:from event)
+                                :to (xmpp:to event)
+                                :type (xmpp:type- event)
+                                :body body)))))))
+
+(defmethod close-connection ((backend cl-xmpp-backend) connection)
+  (declare (ignore backend))
+  (ignore-errors
+    (xmpp:end-xml-stream connection))
+  (ignore-errors
+    (xmpp:disconnect connection))
+  t)
+
+(defmethod send-text ((backend cl-xmpp-backend) profile to body)
+  (call-with-connection
+   backend
+   profile
+   (lambda (connection)
+     (send-connected-text backend connection to body))
+   :send-presence nil))
