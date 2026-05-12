@@ -54,6 +54,7 @@
   (remove "" (split-string (trim-line-end string) #\Newline) :test #'string=))
 
 (defvar *tmux-executable* nil)
+(defvar *codex-executable* nil)
 
 (defun slash-suffixed (directory)
   (if (and (plusp (length directory))
@@ -86,6 +87,12 @@
       (setf *tmux-executable*
             (or (find-executable "tmux")
                 (error "tmux executable was not found in PATH or common locations.")))))
+
+(defun codex-executable ()
+  (or *codex-executable*
+      (setf *codex-executable*
+            (or (find-executable "codex")
+                (error "codex executable was not found in PATH or common locations.")))))
 
 (defun tmux-command (arguments socket)
   (append (list (tmux-executable))
@@ -327,3 +334,44 @@
            t)
       (ignore-errors
         (delete-file temp)))))
+
+(defun route-session-id (route)
+  (let ((session-id (getf route :tmux-session-id))
+        (pane-id (getf route :tmux-pane-id))
+        (socket (getf route :tmux-socket)))
+    (or session-id
+        (getf (pane-location pane-id socket) :tmux-session-id))))
+
+(defun new-codex-context (pane-id socket cwd)
+  (let ((location (pane-location pane-id socket)))
+    (append (list :tmux-socket socket
+                  :tmux-pane-id pane-id
+                  :tmux-pane-current-path cwd)
+            location)))
+
+(defun start-codex-session (route)
+  (let ((pane-id (getf route :tmux-pane-id))
+        (cwd (getf route :cwd))
+        (socket (getf route :tmux-socket)))
+    (unless pane-id
+      (error "Route does not include a tmux pane target."))
+    (unless (and cwd (plusp (length cwd)))
+      (error "Route does not include a working directory."))
+    (let ((session-id (route-session-id route)))
+      (unless session-id
+        (error "Route does not include a tmux session target."))
+      (focus-pane route)
+      (let ((new-pane-id (trim-line-end
+                          (run-tmux (list "new-window"
+                                           "-P"
+                                           "-F"
+                                           "#{pane_id}"
+                                           "-t"
+                                           session-id
+                                           "-c"
+                                           cwd
+                                           (codex-executable))
+                                    :socket socket))))
+        (unless (plusp (length new-pane-id))
+          (error "tmux new-window did not return a pane id."))
+        (new-codex-context new-pane-id socket cwd)))))

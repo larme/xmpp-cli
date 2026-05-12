@@ -144,6 +144,10 @@
 (defun reply-text (body)
   (string-trim *reply-whitespace* (or body "")))
 
+(defun command-text-p (text)
+  (and (plusp (length text))
+       (char= (char text 0) #\/)))
+
 (defun active-routes-for-state (state)
   (load-active-routes :route-ttl-days (route-ttl-days state)))
 
@@ -197,6 +201,152 @@
          from
          "xmpp-cli: no active route; wait for a Codex notification or prepend a route code."))))
 
+(defun parse-agent-command (body)
+  (let ((text (reply-text body)))
+    (when (command-text-p text)
+      (let ((without-slash (subseq text 1)))
+        (multiple-value-bind (name rest)
+            (parse-agent-reply without-slash)
+          (values name rest))))))
+
+(defun split-command-arguments (text)
+  (let ((trimmed (reply-text text)))
+    (when (plusp (length trimmed))
+      (loop with parts = nil
+            with start = 0
+            with length = (length trimmed)
+            while (< start length)
+            for end = (position-if (lambda (char)
+                                     (member char
+                                             *reply-whitespace*
+                                             :test #'char=))
+                                   trimmed
+                                   :start start)
+            do (progn
+                 (push (subseq trimmed start end) parts)
+                 (setf start
+                       (or (and end
+                                (position-if-not
+                                 (lambda (char)
+                                   (member char
+                                           *reply-whitespace*
+                                           :test #'char=))
+                                 trimmed
+                                 :start end))
+                           length)))
+            finally (return (nreverse parts))))))
+
+(defun resolve-command-route (state route-code)
+  (let* ((routes (active-routes-for-state state))
+         (ttl-days (route-ttl-days state)))
+    (if (and route-code (plusp (length route-code)))
+        (find-route-by-code route-code routes ttl-days)
+        (last-active-route routes))))
+
+(defun plist-string (plist key)
+  (let ((value (getf plist key)))
+    (and (stringp value)
+         (plusp (length value))
+         value)))
+
+(defun ensure-new-codex-route (state source-route new-context)
+  (let* ((agent-session "")
+         (host (plist-string source-route :host))
+         (cwd (or (plist-string source-route :cwd)
+                  (plist-string new-context :tmux-pane-current-path)))
+         (display-cwd (if (and (string= (or cwd "")
+                                        (or (getf source-route :cwd) ""))
+                               (plist-string source-route :display-cwd))
+                          (getf source-route :display-cwd)
+                          (display-path cwd)))
+         (socket (or (plist-string new-context :tmux-socket)
+                     (plist-string source-route :tmux-socket)))
+         (session-id (plist-string new-context :tmux-session-id))
+         (window-id (plist-string new-context :tmux-window-id))
+         (pane-id (plist-string new-context :tmux-pane-id))
+         (identity (canonical-route-identity
+                    :host host
+                    :tmux-socket socket
+                    :tmux-session-id session-id
+                    :tmux-window-id window-id
+                    :tmux-pane-id pane-id
+                    :agent :codex
+                    :agent-session agent-session)))
+    (unless pane-id
+      (error "New Codex pane context does not include a tmux pane id."))
+    (unless cwd
+      (error "New Codex pane route does not include a working directory."))
+    (ensure-route identity
+                  :code-length (getf (daemon-state-agent-config state)
+                                     :code-length
+                                     4)
+                  :route-ttl-days (route-ttl-days state)
+                  :agent :codex
+                  :agent-session agent-session
+                  :host host
+                  :cwd cwd
+                  :display-cwd display-cwd
+                  :tmux-socket socket
+                  :tmux-client-name (plist-string source-route
+                                                  :tmux-client-name)
+                  :tmux-client-tty (plist-string source-route
+                                                 :tmux-client-tty)
+                  :tmux-session-id session-id
+                  :tmux-window-id window-id
+                  :tmux-pane-id pane-id)))
+
+(defun handle-new-command (state from arguments)
+  (cond
+    ((> (length arguments) 1)
+     (send-daemon-note state from "xmpp-cli: usage: /new [route-code]"))
+    (t
+     (let* ((route-code (first arguments))
+            (route (resolve-command-route state route-code)))
+       (cond
+         ((null route)
+          (send-daemon-note
+           state
+           from
+           (if route-code
+               (format nil "xmpp-cli: unknown route code ~a" route-code)
+               "xmpp-cli: no active route; wait for a Codex notification or pass /new <route-code>.")))
+         (t
+          (handler-case
+              (let* ((new-context (start-codex-session route))
+                     (updated-route (mark-route-used route))
+                     (new-route (ensure-new-codex-route state
+                                                        updated-route
+                                                        new-context)))
+                (send-daemon-note
+                 state
+                 from
+                 (format nil "xmpp-cli: started new Codex session ~a from ~a in window ~a pane ~a"
+                         (getf new-route :code)
+                         (getf route :code)
+                         (or (getf new-route :tmux-window-id) "unknown")
+                         (getf new-route :tmux-pane-id))))
+            (error (condition)
+              (send-daemon-note
+               state
+               from
+               (format nil "xmpp-cli: /new failed for ~a: ~a"
+                       (getf route :code)
+                       condition))))))))))
+
+(defun handle-agent-command (state from body)
+  (multiple-value-bind (name rest)
+      (parse-agent-command body)
+    (cond
+      ((null name)
+       nil)
+      ((string= name "new")
+       (handle-new-command state from (split-command-arguments rest)))
+      (t
+       (send-daemon-note
+        state
+        from
+        (format nil "xmpp-cli: unknown command /~a" name))))))
+
 (defun handle-incoming-message (state message)
   (let ((from (getf message :from))
         (body (getf message :body)))
@@ -207,7 +357,10 @@
                  "~&xmpp-cli daemon: ignored message from unauthorized sender ~a~%"
                  (or from "<unknown>")))
         (t
-         (handle-route-reply state from body))))))
+         (let ((text (reply-text body)))
+           (if (command-text-p text)
+               (handle-agent-command state from text)
+               (handle-route-reply state from text))))))))
 
 (defun sleep-until-stop (state seconds)
   (loop repeat seconds

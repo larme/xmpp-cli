@@ -137,7 +137,8 @@
    #:capture-context
    #:context-available-p
    #:focus-pane
-   #:paste-text-and-enter))
+   #:paste-text-and-enter
+   #:start-codex-session))
 
 (defpackage #:xmpp-cli/agent-codex
   (:use #:cl)
@@ -209,6 +210,7 @@
 (defpackage #:xmpp-cli/agent-daemon
   (:use #:cl)
   (:import-from #:xmpp-cli/util
+                #:display-path
                 #:now-iso8601)
   (:import-from #:xmpp-cli/state
                 #:load-config
@@ -217,13 +219,16 @@
                 #:load-agent-config
                 #:allowed-senders)
   (:import-from #:xmpp-cli/agent-routes
+                #:canonical-route-identity
+                #:ensure-route
                 #:load-active-routes
                 #:find-route-by-code
                 #:last-active-route
                 #:mark-route-used)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane
-                #:paste-text-and-enter)
+                #:paste-text-and-enter
+                #:start-codex-session)
   (:import-from #:xmpp-cli/backend
                 #:call-with-connection
                 #:send-connected-text

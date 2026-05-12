@@ -167,6 +167,12 @@ When replying from XMPP, prefix a route code to target a specific Codex pane.
 If the message does not start with an active route code, the daemon sends it to
 the most recently active route.
 
+Messages beginning with `/` are treated as commands. `/new [route-code]`
+starts a fresh Codex session in a new tmux window, using the same working
+directory and tmux session as the selected route. When `route-code` is omitted,
+the most recently active route is used. The daemon reply includes the new route
+code for the fresh window.
+
 ## Tests
 
 The test system covers JID parsing, config round trips, history metadata, CLI validation, and CLI send behavior through a fake backend.

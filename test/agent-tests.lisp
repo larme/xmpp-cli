@@ -289,6 +289,94 @@
         (check (not default-route-p)
                "reply with an active route code should stay explicit")))))
 
+(deftest agent-new-command-resolves-explicit-and-default-route
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-a"
+                          :code "aaaa"
+                          :identity "route-a"
+                          :created-at older
+                          :last-seen-at older
+                          :last-used-at nil))
+           (route-b (list :route-id "route-b"
+                          :code "bbbb"
+                          :identity "route-b"
+                          :created-at older
+                          :last-seen-at newer
+                          :last-used-at nil))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (multiple-value-bind (name rest)
+          (xmpp-cli/agent-daemon::parse-agent-command "/new AAAA")
+        (check-equal "new" name)
+        (check-equal "AAAA" rest))
+      (check-equal '("AAAA")
+                   (xmpp-cli/agent-daemon::split-command-arguments " AAAA "))
+      (check-equal "aaaa"
+                   (getf (xmpp-cli/agent-daemon::resolve-command-route
+                          state
+                          "AAAA")
+                         :code))
+      (check-equal "bbbb"
+                   (getf (xmpp-cli/agent-daemon::resolve-command-route
+                          state
+                          nil)
+                         :code)))))
+
+(deftest agent-new-command-allocates-route-for-new-window
+  (with-isolated-data
+    (let* ((source-identity (xmpp-cli/agent-routes:canonical-route-identity
+                             :host "hbox"
+                             :tmux-socket "/tmp/tmux-1000/default"
+                             :tmux-session-id "$1"
+                             :tmux-window-id "@3"
+                             :tmux-pane-id "%12"
+                             :agent :codex
+                             :agent-session "source-session"))
+           (source-route (xmpp-cli/agent-routes:ensure-route
+                          source-identity
+                          :agent :codex
+                          :agent-session "source-session"
+                          :host "hbox"
+                          :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                          :display-cwd "~/codes/cl-projects/xmpp-cli"
+                          :tmux-socket "/tmp/tmux-1000/default"
+                          :tmux-client-name "/dev/pts/45"
+                          :tmux-client-tty "/dev/pts/45"
+                          :tmux-session-id "$1"
+                          :tmux-window-id "@3"
+                          :tmux-pane-id "%12"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :agent-config (list :code-length 4
+                                       :route-ttl-days 90)))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@99"
+                              :tmux-pane-id "%99"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli"))
+           (new-route (xmpp-cli/agent-daemon::ensure-new-codex-route
+                       state
+                       source-route
+                       new-context))
+           (new-code (getf new-route :code)))
+      (check-equal 4 (length new-code))
+      (check (not (string= new-code (getf source-route :code)))
+             "/new should allocate a distinct route code for the new window")
+      (check-equal "%99" (getf new-route :tmux-pane-id))
+      (check-equal "@99" (getf new-route :tmux-window-id))
+      (check-equal "/dev/pts/45" (getf new-route :tmux-client-name))
+      (check-equal "~/codes/cl-projects/xmpp-cli"
+                   (getf new-route :display-cwd))
+      (check-equal new-code
+                   (getf (xmpp-cli/agent-routes:find-route-by-code new-code)
+                         :code))
+      (check-equal new-code
+                   (getf (xmpp-cli/agent-routes:last-active-route)
+                         :code)))))
+
 (deftest codex-notification-allocates-route-code
   (with-isolated-data
     (let* ((cwd (namestring (uiop:getcwd)))
