@@ -1,6 +1,8 @@
 (in-package #:xmpp-cli/agent-routes)
 
 (defparameter *code-alphabet* "abcdefghijklmnopqrstuvwxyz")
+(defparameter *routes-lock-stale-seconds* 30)
+(defparameter *routes-lock-wait-seconds* 10)
 
 (defun agent-directory ()
   (merge-pathnames "agent/" (home-xmpp-cli-directory)))
@@ -8,11 +10,141 @@
 (defun routes-pathname ()
   (merge-pathnames "routes.yaml" (agent-directory)))
 
+(defun routes-lock-pathname ()
+  (merge-pathnames "routes.lock" (agent-directory)))
+
 (defun routes-temp-pathname ()
-  (merge-pathnames "routes.yaml.tmp" (agent-directory)))
+  (merge-pathnames
+   (format nil "routes.yaml.~36r.~36r.tmp"
+           (get-universal-time)
+           (random 1000000000))
+   (agent-directory)))
 
 (defun ensure-agent-directory ()
   (ensure-private-directory (agent-directory)))
+
+(defun make-routes-lock-token ()
+  (format nil "~36r-~36r-~36r"
+          (get-universal-time)
+          (get-internal-real-time)
+          (random 1000000000)))
+
+(defun route-lock-to-yaml (token pid)
+  (let ((mapping (list (cons "token" token)
+                       (cons "created_at" (now-iso8601)))))
+    (when pid
+      (setf mapping (append mapping (list (cons "pid" pid)))))
+    mapping))
+
+(defun yaml-to-route-lock (yaml)
+  (unless (listp yaml)
+    (error "Malformed agent/routes.lock: expected a mapping."))
+  (let ((lock (list :token (yaml-value yaml "token" nil)
+                    :created-at (yaml-value yaml "created_at" nil)
+                    :pid (yaml-value yaml "pid" nil))))
+    (unless (and (stringp (getf lock :token))
+                 (plusp (length (getf lock :token))))
+      (error "Malformed agent/routes.lock: missing token."))
+    (when (and (getf lock :pid)
+               (not (integerp (getf lock :pid))))
+      (error "Malformed agent/routes.lock: pid must be an integer."))
+    lock))
+
+(defun read-legacy-route-lock ()
+  (handler-case
+      (let ((text (read-file-as-string (routes-lock-pathname))))
+        (let ((token (string-trim '(#\Newline #\Return #\Space #\Tab)
+                                  text)))
+          (and (plusp (length token))
+               (list :token token
+                     :pid nil
+                     :created-at nil))))
+    (error ()
+      nil)))
+
+(defun load-routes-lock ()
+  (let ((pathname (routes-lock-pathname)))
+    (and (probe-file pathname)
+         (or (handler-case
+                 (yaml-to-route-lock (read-yaml-file pathname))
+               (error ()
+                 nil))
+             (read-legacy-route-lock)))))
+
+(defun try-acquire-routes-lock (token)
+  (handler-case
+      (let ((stream (open (routes-lock-pathname)
+                          :direction :output
+                          :if-exists nil
+                          :if-does-not-exist :create
+                          :element-type 'character
+                          :external-format :utf-8)))
+        (when stream
+          (unwind-protect
+               (progn
+                 (write-string
+                  (emit-yaml
+                   (route-lock-to-yaml token (current-process-id)))
+                  stream)
+                 (finish-output stream)
+                 t)
+            (close stream))))
+    (file-error ()
+      nil)))
+
+(defun stale-routes-lock-p ()
+  (let* ((pathname (probe-file (routes-lock-pathname)))
+         (lock (and pathname (load-routes-lock)))
+         (pid (and lock (getf lock :pid)))
+         (write-date (and pathname (file-write-date pathname))))
+    (cond
+      (pid
+       (not (process-exists-p pid)))
+      (write-date
+       (> (- (get-universal-time) write-date)
+          *routes-lock-stale-seconds*))
+      (t
+       nil))))
+
+(defun routes-lock-owned-p (token)
+  (handler-case
+      (let ((lock (load-routes-lock)))
+        (and lock
+             (string= token
+                      (getf lock :token))))
+    (error ()
+      nil)))
+
+(defun release-routes-lock (token)
+  (when (and token (routes-lock-owned-p token))
+    (ignore-errors
+      (delete-file (routes-lock-pathname)))
+    t))
+
+(defun acquire-routes-lock (token &key
+                                    (timeout-seconds *routes-lock-wait-seconds*))
+  (ensure-agent-directory)
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout-seconds
+                               internal-time-units-per-second)))))
+    (loop
+      (when (try-acquire-routes-lock token)
+        (return t))
+      (when (stale-routes-lock-p)
+        (ignore-errors
+          (delete-file (routes-lock-pathname))))
+      (when (>= (get-internal-real-time) deadline)
+        (error "Timed out waiting for agent route lock at ~a."
+               (namestring (routes-lock-pathname))))
+      (sleep 0.05))))
+
+(defun call-with-routes-lock (thunk)
+  (let ((token (make-routes-lock-token)))
+    (unwind-protect
+         (progn
+           (acquire-routes-lock token)
+           (funcall thunk))
+      (release-routes-lock token))))
 
 (defun canonical-route-identity (&key host
                                       tmux-socket
@@ -84,19 +216,32 @@
   (list (cons "version" 1)
         (cons "routes" (mapcar #'route-to-yaml routes))))
 
-(defun load-routes ()
+(defun load-routes-from-disk ()
   (let ((pathname (routes-pathname)))
     (if (probe-file pathname)
         (yaml-to-routes-file (read-yaml-file pathname))
         nil)))
 
-(defun save-routes (routes)
+(defun save-routes-to-disk (routes)
   (ensure-agent-directory)
   (let ((temp (routes-temp-pathname))
         (target (routes-pathname)))
-    (write-yaml-file temp (routes-file-to-yaml routes))
-    (uiop:rename-file-overwriting-target temp target)
+    (unwind-protect
+         (progn
+           (write-yaml-file temp (routes-file-to-yaml routes))
+           (uiop:rename-file-overwriting-target temp target))
+      (when (probe-file temp)
+        (ignore-errors
+          (delete-file temp))))
     target))
+
+(defun load-routes ()
+  (load-routes-from-disk))
+
+(defun save-routes (routes)
+  (call-with-routes-lock
+   (lambda ()
+     (save-routes-to-disk routes))))
 
 (defun parse-fixed-integer (string start end)
   (parse-integer string :start start :end end :junk-allowed nil))
@@ -177,13 +322,18 @@
                  routes)
       routes))
 
-(defun load-active-routes (&key route-ttl-days)
-  (let* ((routes (load-routes))
+(defun load-active-routes-from-disk (&key route-ttl-days)
+  (let* ((routes (load-routes-from-disk))
          (active (active-routes routes route-ttl-days)))
     (when (and route-ttl-days
                (/= (length routes) (length active)))
-      (save-routes active))
+      (save-routes-to-disk active))
     active))
+
+(defun load-active-routes (&key route-ttl-days)
+  (call-with-routes-lock
+   (lambda ()
+     (load-active-routes-from-disk :route-ttl-days route-ttl-days))))
 
 (defun find-route-by-id (routes route-id)
   (find route-id routes :test #'string= :key (lambda (route)
@@ -244,41 +394,47 @@
                                 tmux-session-id
                                 tmux-window-id
                                 tmux-pane-id)
-  (let* ((routes (load-active-routes :route-ttl-days route-ttl-days))
-         (route-id (route-id-for-identity identity))
-         (existing (find-route-by-id routes route-id))
-         (now (now-iso8601))
-         (metadata (list :agent agent
-                         :agent-session agent-session
-                         :host host
-                         :cwd cwd
-                         :display-cwd display-cwd
-                         :tmux-socket tmux-socket
-                         :tmux-client-name tmux-client-name
-                         :tmux-client-tty tmux-client-tty
-                         :tmux-session-id tmux-session-id
-                         :tmux-window-id tmux-window-id
-                         :tmux-pane-id tmux-pane-id)))
-    (if existing
-        (let* ((updated (update-route-metadata existing metadata now))
-               (new-routes (cons updated (remove existing routes :test #'eq))))
-          (save-routes new-routes)
-          (values updated new-routes nil))
-        (let* ((code (allocate-route-code routes code-length))
-               (route (make-route route-id code identity metadata now))
-               (new-routes (cons route routes)))
-          (save-routes new-routes)
-          (values route new-routes t)))))
+  (call-with-routes-lock
+   (lambda ()
+     (let* ((routes (load-active-routes-from-disk
+                     :route-ttl-days route-ttl-days))
+            (route-id (route-id-for-identity identity))
+            (existing (find-route-by-id routes route-id))
+            (now (now-iso8601))
+            (metadata (list :agent agent
+                            :agent-session agent-session
+                            :host host
+                            :cwd cwd
+                            :display-cwd display-cwd
+                            :tmux-socket tmux-socket
+                            :tmux-client-name tmux-client-name
+                            :tmux-client-tty tmux-client-tty
+                            :tmux-session-id tmux-session-id
+                            :tmux-window-id tmux-window-id
+                            :tmux-pane-id tmux-pane-id)))
+       (if existing
+           (let* ((updated (update-route-metadata existing metadata now))
+                  (new-routes (cons updated
+                                    (remove existing routes :test #'eq))))
+             (save-routes-to-disk new-routes)
+             (values updated new-routes nil))
+           (let* ((code (allocate-route-code routes code-length))
+                  (route (make-route route-id code identity metadata now))
+                  (new-routes (cons route routes)))
+             (save-routes-to-disk new-routes)
+             (values route new-routes t)))))))
 
 (defun mark-route-used (route &optional (now (now-iso8601)))
-  (let* ((routes (load-routes))
-         (route-id (getf route :route-id))
-         (existing (and route-id (find-route-by-id routes route-id))))
-    (unless existing
-      (error "Route no longer exists for code ~a." (getf route :code)))
-    (let* ((updated (copy-list existing))
-           (new-routes nil))
-      (setf (getf updated :last-used-at) now)
-      (setf new-routes (cons updated (remove existing routes :test #'eq)))
-      (save-routes new-routes)
-      updated)))
+  (call-with-routes-lock
+   (lambda ()
+     (let* ((routes (load-routes-from-disk))
+            (route-id (getf route :route-id))
+            (existing (and route-id (find-route-by-id routes route-id))))
+       (unless existing
+         (error "Route no longer exists for code ~a." (getf route :code)))
+       (let* ((updated (copy-list existing))
+              (new-routes nil))
+         (setf (getf updated :last-used-at) now)
+         (setf new-routes (cons updated (remove existing routes :test #'eq)))
+         (save-routes-to-disk new-routes)
+         updated)))))

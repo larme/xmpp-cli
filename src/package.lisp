@@ -9,6 +9,8 @@
    #:display-path
    #:split-jid
    #:now-iso8601
+   #:current-process-id
+   #:process-exists-p
    #:utf-8-octets
    #:utf-8-byte-length
    #:sha256-hex))
@@ -103,9 +105,13 @@
   (:import-from #:xmpp-cli/util
                 #:home-xmpp-cli-directory
                 #:ensure-private-directory
+                #:read-file-as-string
                 #:now-iso8601
+                #:current-process-id
+                #:process-exists-p
                 #:sha256-hex)
   (:import-from #:xmpp-cli/yaml
+                #:emit-yaml
                 #:read-yaml-file
                 #:write-yaml-file
                 #:yaml-value
@@ -113,6 +119,7 @@
                 #:yaml-null-p)
   (:export
    #:routes-pathname
+   #:routes-lock-pathname
    #:canonical-route-identity
    #:route-id-for-identity
    #:random-route-code
@@ -180,7 +187,9 @@
   (:use #:cl)
   (:import-from #:xmpp-cli/util
                 #:ensure-private-directory
-                #:now-iso8601)
+                #:now-iso8601
+                #:sha256-hex
+                #:utf-8-octets)
   (:import-from #:xmpp-cli/yaml
                 #:emit-yaml
                 #:read-yaml-file
@@ -199,7 +208,9 @@
    #:release-daemon-lock
    #:delete-stale-daemon-lock
    #:make-control-token
+   #:profile-digest
    #:read-ipc-message
+   #:read-ipc-message-with-timeout
    #:write-ipc-message
    #:make-ipc-stream
    #:request-control
@@ -211,7 +222,9 @@
   (:use #:cl)
   (:import-from #:xmpp-cli/util
                 #:display-path
-                #:now-iso8601)
+                #:now-iso8601
+                #:current-process-id
+                #:process-exists-p)
   (:import-from #:xmpp-cli/state
                 #:load-config
                 #:profile)
@@ -244,7 +257,9 @@
                 #:release-daemon-lock
                 #:delete-stale-daemon-lock
                 #:make-control-token
+                #:profile-digest
                 #:read-ipc-message
+                #:read-ipc-message-with-timeout
                 #:write-ipc-message
                 #:make-ipc-stream
                 #:daemon-status)
@@ -300,9 +315,11 @@
   (:import-from #:xmpp-cli/yaml
                 #:emit-yaml)
   (:import-from #:xmpp-cli/agent-ipc
+                #:load-control
                 #:daemon-send
                 #:daemon-status
-                #:daemon-stop)
+                #:daemon-stop
+                #:profile-digest)
   (:import-from #:xmpp-cli/agent-routes
                 #:find-active-route-by-code)
   (:import-from #:xmpp-cli/tmux

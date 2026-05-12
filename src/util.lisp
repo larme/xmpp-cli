@@ -104,6 +104,41 @@
       (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d~c~2,'0d:~2,'0d"
               year month day hour minute second sign offset-hours offset-rest-minutes))))
 
+(defun current-process-id ()
+  #+sbcl
+  (or (ignore-errors (sb-posix:getpid)) nil)
+  #-sbcl
+  (let* ((package (find-package "SYSTEM"))
+         (symbol (and package (find-symbol "GETPID" package))))
+    (and symbol
+         (fboundp symbol)
+         (ignore-errors (funcall symbol)))))
+
+#+linux
+(defun linux-process-state (pid)
+  (handler-case
+      (with-open-file (in (format nil "/proc/~d/stat" pid)
+                          :direction :input
+                          :element-type 'character)
+        (let* ((line (read-line in nil ""))
+               (close (position #\) line :from-end t))
+               (state-index (and close (+ close 2))))
+          (and state-index
+               (< state-index (length line))
+               (char line state-index))))
+    (error ()
+      nil)))
+
+(defun process-exists-p (pid)
+  (and (integerp pid)
+       (plusp pid)
+       #+linux
+       (let ((state (linux-process-state pid)))
+         (and state
+              (not (char= state #\Z))))
+       #-linux
+       t))
+
 (defun utf-8-octet-length-for-code (code)
   (cond
     ((<= code #x7f) 1)

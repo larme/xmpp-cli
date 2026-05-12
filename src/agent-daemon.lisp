@@ -17,16 +17,7 @@
 
 (defparameter *reply-whitespace* '(#\Space #\Tab #\Newline #\Return))
 (defparameter *daemon-thread-stop-wait-seconds* 5)
-
-(defun current-process-id ()
-  #+sbcl
-  (or (ignore-errors (sb-posix:getpid)) nil)
-  #-sbcl
-  (let* ((package (find-package "SYSTEM"))
-         (symbol (and package (find-symbol "GETPID" package))))
-    (and symbol
-         (fboundp symbol)
-         (ignore-errors (funcall symbol)))))
+(defparameter *daemon-client-timeout-seconds* 2)
 
 (defun bare-jid (jid)
   (let ((text (or jid "")))
@@ -51,11 +42,29 @@
   (bt:with-lock-held ((daemon-state-lock state))
     (daemon-state-stop-p state)))
 
+(defun wake-control-server (server)
+  (let ((port (and server
+                   (ignore-errors
+                     (usocket:get-local-port server)))))
+    (when port
+      (ignore-errors
+        (let ((client (usocket:socket-connect "127.0.0.1"
+                                              port
+                                              :element-type '(unsigned-byte 8)
+                                              :timeout 1)))
+          (usocket:socket-close client))))))
+
 (defun request-stop (state)
-  (let ((connection nil))
+  (let ((connection nil)
+        (server nil))
     (bt:with-lock-held ((daemon-state-lock state))
       (setf (daemon-state-stop-p state) t)
-      (setf connection (daemon-state-connection state)))
+      (setf connection (daemon-state-connection state))
+      (setf server (daemon-state-server-socket state)))
+    (when server
+      (wake-control-server server)
+      (ignore-errors
+        (usocket:socket-close server)))
     (when connection
       (ignore-errors
         (close-connection (daemon-state-backend state) connection)))))
@@ -99,6 +108,8 @@
               :profile (daemon-state-profile-name state)
               :control-host (getf control :host)
               :control-port (getf control :port)
+              :profile-jid (getf control :profile-jid)
+              :profile-digest (getf control :profile-digest)
               :xmpp-status (daemon-state-xmpp-status state)
               :connected (eq (daemon-state-xmpp-status state) :connected)
               :connected-at (daemon-state-connected-at state)
@@ -445,13 +456,25 @@
         (status-plist state))
        (:send
         (let ((to (getf request :to))
-              (body (getf request :body)))
-          (if (and (stringp to) (plusp (length to)) (stringp body))
-              (multiple-value-bind (ok error-text) (daemon-send-text state to body)
-                (if ok
-                    (list :ok t)
-                    (list :ok nil :error error-text)))
-              (list :ok nil :error "Malformed send request."))))
+              (body (getf request :body))
+              (expected-profile-digest
+                (getf request :expected-profile-digest))
+              (actual-profile-digest
+                (getf (daemon-state-control state) :profile-digest)))
+          (cond
+            ((not (and (stringp expected-profile-digest)
+                       (stringp actual-profile-digest)
+                       (string= expected-profile-digest
+                                actual-profile-digest)))
+             (list :ok nil
+                   :error "Daemon profile does not match send request."))
+            ((and (stringp to) (plusp (length to)) (stringp body))
+             (multiple-value-bind (ok error-text) (daemon-send-text state to body)
+               (if ok
+                   (list :ok t)
+                   (list :ok nil :error error-text))))
+            (t
+             (list :ok nil :error "Malformed send request.")))))
        (:stop
         (request-stop state)
         (list :ok t))
@@ -462,7 +485,11 @@
   (unwind-protect
        (let ((stream (make-ipc-stream socket)))
          (handler-case
-             (let* ((request (read-ipc-message stream))
+             (let* ((request (read-ipc-message-with-timeout
+                              socket
+                              stream
+                              *daemon-client-timeout-seconds*
+                              "Daemon IPC request"))
                     (response (handle-control-request state request)))
                (write-ipc-message stream response))
            (error (condition)
@@ -474,6 +501,11 @@
     (ignore-errors
       (usocket:socket-close socket))))
 
+(defun start-control-client-thread (state client)
+  (bt:make-thread (lambda ()
+                    (handle-client state client))
+                  :name "xmpp-cli daemon control client"))
+
 (defun accept-control-loop (state)
   (let ((server (daemon-state-server-socket state)))
     (loop until (state-stopped-p state)
@@ -481,7 +513,7 @@
                  (let ((client (usocket:socket-accept
                                 server
                                 :element-type '(unsigned-byte 8))))
-                   (handle-client state client))
+                   (start-control-client-thread state client))
                (error (condition)
                  (unless (state-stopped-p state)
                    (format *error-output*
@@ -494,31 +526,6 @@
   (multiple-value-bind (ok response error) (daemon-status)
     (declare (ignore response error))
     ok))
-
-#+linux
-(defun linux-process-state (pid)
-  (handler-case
-      (with-open-file (in (format nil "/proc/~d/stat" pid)
-                          :direction :input
-                          :element-type 'character)
-        (let* ((line (read-line in nil ""))
-               (close (position #\) line :from-end t))
-               (state-index (and close (+ close 2))))
-          (and state-index
-               (< state-index (length line))
-               (char line state-index))))
-    (error ()
-      nil)))
-
-(defun process-exists-p (pid)
-  (and (integerp pid)
-       (plusp pid)
-       #+linux
-       (let ((state (linux-process-state pid)))
-         (and state
-              (not (char= state #\Z))))
-       #-linux
-       t))
 
 (defun lock-control-pid (lock)
   (handler-case
@@ -574,13 +581,15 @@
            (fail-daemon-lock-held lock))))))
   t)
 
-(defun make-control (server profile-name token)
+(defun make-control (server profile-name profile-plist token)
   (list :pid (current-process-id)
         :host "127.0.0.1"
         :port (usocket:get-local-port server)
         :token token
         :started-at (now-iso8601)
-        :profile profile-name))
+        :profile profile-name
+        :profile-jid (getf profile-plist :jid)
+        :profile-digest (profile-digest profile-plist)))
 
 (defun wait-for-thread-stop (thread seconds)
   (let ((deadline (+ (get-internal-real-time)
@@ -631,7 +640,10 @@
                                                0
                                                :reuse-address t
                                                :element-type '(unsigned-byte 8)))
-           (let ((control (make-control server profile-name token)))
+           (let ((control (make-control server
+                                        profile-name
+                                        profile-plist
+                                        token)))
              (setf state (make-daemon-state :backend backend
                                             :profile-name profile-name
                                             :profile profile-plist

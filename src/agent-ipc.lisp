@@ -1,5 +1,10 @@
 (in-package #:xmpp-cli/agent-ipc)
 
+(defparameter *control-connect-timeout-seconds* 1)
+(defparameter *control-io-timeout-seconds* 10)
+(defparameter *max-ipc-frame-octets* (* 1024 1024))
+(defparameter *max-ipc-frame-length-line-chars* 20)
+
 (defun control-pathname ()
   (merge-pathnames "control.yaml" (agent-directory)))
 
@@ -15,7 +20,9 @@
         (cons "port" (getf control :port))
         (cons "token" (getf control :token))
         (cons "started_at" (getf control :started-at))
-        (cons "profile" (getf control :profile))))
+        (cons "profile" (getf control :profile))
+        (cons "profile_jid" (getf control :profile-jid))
+        (cons "profile_digest" (getf control :profile-digest))))
 
 (defun yaml-to-control (yaml)
   (unless (listp yaml)
@@ -25,7 +32,9 @@
                        :port (yaml-value yaml "port" nil)
                        :token (yaml-value yaml "token" nil)
                        :started-at (yaml-value yaml "started_at" nil)
-                       :profile (yaml-value yaml "profile" nil))))
+                       :profile (yaml-value yaml "profile" nil)
+                       :profile-jid (yaml-value yaml "profile_jid" nil)
+                       :profile-digest (yaml-value yaml "profile_digest" nil))))
     (unless (and (stringp (getf control :host))
                  (plusp (length (getf control :host)))
                  (integerp (getf control :port))
@@ -135,20 +144,166 @@
   (string-downcase
    (ironclad:byte-array-to-hex-string (ironclad:random-data 32))))
 
+(defun profile-digest (profile)
+  (sha256-hex
+   (with-output-to-string (out nil :element-type 'character)
+     (let ((*print-circle* nil)
+           (*print-pretty* nil)
+           (*print-readably* t))
+       (write profile :stream out :readably t)))))
+
 (defun make-ipc-stream (socket)
-  (flexi-streams:make-flexi-stream (usocket:socket-stream socket)
-                                   :external-format :utf-8))
+  (usocket:socket-stream socket))
+
+(defun ipc-payload-string (message)
+  (with-output-to-string (out nil :element-type 'character)
+    (let ((*print-circle* nil)
+          (*print-readably* t)
+          (*print-pretty* nil))
+      (write message :stream out :readably t))))
+
+(defun write-ascii-octets (stream string)
+  (loop for char across string
+        for code = (char-code char)
+        do (unless (<= 0 code #x7f)
+             (error "Cannot write non-ASCII byte to IPC frame header: ~s."
+                    char))
+           (write-byte code stream)))
 
 (defun write-ipc-message (stream message)
-  (let ((*print-circle* nil)
-        (*print-readably* t))
-    (write message :stream stream :readably t)
-    (terpri stream)
+  (let* ((payload (ipc-payload-string message))
+         (octets (utf-8-octets payload)))
+    (validate-ipc-frame-length (length octets))
+    (write-ascii-octets stream (princ-to-string (length octets)))
+    (write-byte 10 stream)
+    (write-sequence octets stream)
     (finish-output stream)))
 
-(defun read-ipc-message (stream)
+(defun parse-ipc-payload (payload)
   (let ((*read-eval* nil))
-    (read stream nil nil)))
+    (read-from-string payload nil nil)))
+
+(defun parse-ipc-length (line)
+  (unless line
+    (error "Daemon IPC connection closed before message length."))
+  (when (> (length line) *max-ipc-frame-length-line-chars*)
+    (error "Daemon IPC message length is too long."))
+  (validate-ipc-frame-length
+   (parse-integer line :junk-allowed nil)))
+
+(defun validate-ipc-frame-length (length)
+  (unless (and (integerp length)
+               (not (minusp length))
+               (<= length *max-ipc-frame-octets*))
+    (error "Daemon IPC message length ~a exceeds maximum ~d octets."
+           length
+           *max-ipc-frame-octets*))
+  length)
+
+(defun decode-ipc-payload-octets (octets)
+  (flexi-streams:octets-to-string octets :external-format :utf-8))
+
+(defun read-ipc-line (stream)
+  (let ((count 0))
+    (with-output-to-string (out nil :element-type 'character)
+      (loop for byte = (read-byte stream nil nil)
+            do (unless byte
+                 (error "Daemon IPC connection closed before message length."))
+               (cond
+                 ((= byte 10)
+                  (return))
+                 ((= byte 13)
+                  nil)
+                 ((<= 0 byte #x7f)
+                  (when (>= count *max-ipc-frame-length-line-chars*)
+                    (error "Daemon IPC message length is too long."))
+                  (write-char (code-char byte) out)
+                  (incf count))
+                 (t
+                  (error "Daemon IPC message length contains non-ASCII byte: ~d."
+                         byte)))))))
+
+(defun read-ipc-payload (stream length)
+  (setf length (validate-ipc-frame-length length))
+  (let ((octets (make-array length :element-type '(unsigned-byte 8))))
+    (loop for index below length
+          for byte = (read-byte stream nil nil)
+          do (unless byte
+               (error "Daemon IPC connection closed before message body."))
+             (setf (aref octets index) byte))
+    octets))
+
+(defun read-ipc-message (stream)
+  (parse-ipc-payload
+   (decode-ipc-payload-octets
+    (read-ipc-payload stream
+                      (parse-ipc-length (read-ipc-line stream))))))
+
+(defun control-deadline (timeout-seconds)
+  (+ (get-internal-real-time)
+     (round (* timeout-seconds internal-time-units-per-second))))
+
+(defun control-time-remaining (deadline)
+  (max 0
+       (/ (- deadline (get-internal-real-time))
+          internal-time-units-per-second)))
+
+(defun socket-readable-p (socket timeout)
+  (multiple-value-bind (ready remaining)
+      (usocket:wait-for-input socket :timeout timeout :ready-only t)
+    (declare (ignore remaining))
+    (and ready t)))
+
+(defun read-byte-with-timeout (socket stream deadline label)
+  (let ((remaining (control-time-remaining deadline)))
+    (unless (plusp remaining)
+      (error "~a timed out." label))
+    (unless (socket-readable-p socket remaining)
+      (error "~a timed out." label))
+    (or (read-byte stream nil nil)
+        (error "~a connection closed." label))))
+
+(defun read-ipc-line-with-timeout (socket stream deadline label)
+  (let ((count 0))
+    (with-output-to-string (out nil :element-type 'character)
+      (loop for byte = (read-byte-with-timeout socket stream deadline label)
+            do (cond
+                 ((= byte 10)
+                  (return))
+                 ((= byte 13)
+                  nil)
+                 ((<= 0 byte #x7f)
+                  (when (>= count *max-ipc-frame-length-line-chars*)
+                    (error "~a length is too long." label))
+                  (write-char (code-char byte) out)
+                  (incf count))
+                 (t
+                  (error "~a length contains non-ASCII byte: ~d."
+                         label
+                         byte)))))))
+
+(defun read-ipc-payload-with-timeout (socket stream length deadline label)
+  (setf length (validate-ipc-frame-length length))
+  (let ((octets (make-array length :element-type '(unsigned-byte 8))))
+    (loop for index below length
+          for byte = (read-byte-with-timeout socket stream deadline label)
+          do (setf (aref octets index) byte))
+    octets))
+
+(defun read-ipc-message-with-timeout (socket stream timeout-seconds label)
+  (let* ((deadline (control-deadline timeout-seconds))
+         (length (parse-ipc-length
+                  (read-ipc-line-with-timeout socket
+                                              stream
+                                              deadline
+                                              label))))
+    (parse-ipc-payload
+     (decode-ipc-payload-octets
+      (read-ipc-payload-with-timeout socket
+                                     stream
+                                     length
+                                     deadline
+                                     label)))))
 
 (defun request-control (payload)
   "Send PAYLOAD to the running daemon. Return RESPONSE and ERROR."
@@ -162,12 +317,17 @@
         (let ((socket (usocket:socket-connect host
                                               port
                                               :element-type '(unsigned-byte 8)
-                                              :timeout 1)))
+                                              :timeout
+                                              *control-connect-timeout-seconds*)))
           (unwind-protect
                (let ((stream (make-ipc-stream socket)))
                  (write-ipc-message stream
                                     (append (list :token token) payload))
-                 (let ((response (read-ipc-message stream)))
+                 (let ((response (read-ipc-message-with-timeout
+                                  socket
+                                  stream
+                                  *control-io-timeout-seconds*
+                                  "Daemon IPC response")))
                    (values response nil)))
             (ignore-errors
               (usocket:socket-close socket)))))
@@ -178,11 +338,13 @@
   (or (and (listp response) (getf response :error))
       fallback))
 
-(defun daemon-send (to body)
+(defun daemon-send (to body &key expected-profile-digest)
   (multiple-value-bind (response error) (request-control
                                          (list :op :send
                                                :to to
-                                               :body body))
+                                               :body body
+                                               :expected-profile-digest
+                                               expected-profile-digest))
     (cond
       ((and (listp response) (getf response :ok))
        (values t response nil))

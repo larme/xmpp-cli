@@ -126,6 +126,10 @@ logs/
 
 The implementation makes a best-effort attempt to set the state directory to mode `0700` and state files to mode `0600` on Unix-like systems. History stores only metadata, byte counts, SHA-256 hashes, and send results. It does not store message bodies.
 
+The state directory is local machine state and should not be shared across
+machines or network filesystems. For multi-machine agent use, configure a
+separate XMPP account and local state directory on each machine.
+
 Use an app-specific XMPP password when your server supports one.
 
 ## Backend Notes

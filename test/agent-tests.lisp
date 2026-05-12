@@ -102,6 +102,48 @@
                              (getf route :code))
                            (xmpp-cli/agent-routes:load-routes))))))
 
+(deftest route-lock-is-exclusive-and-temp-paths-are-unique
+  (with-isolated-data
+    (let ((temp-a (xmpp-cli/agent-routes::routes-temp-pathname))
+          (temp-b (xmpp-cli/agent-routes::routes-temp-pathname))
+          (token-a (xmpp-cli/agent-routes::make-routes-lock-token))
+          (token-b (xmpp-cli/agent-routes::make-routes-lock-token)))
+      (check (not (equal (namestring temp-a) (namestring temp-b)))
+             "route temp paths should be unique")
+      (check (xmpp-cli/agent-routes::acquire-routes-lock token-a)
+             "first route lock acquire should succeed")
+      (check-signals-error
+        (xmpp-cli/agent-routes::acquire-routes-lock token-b
+                                                    :timeout-seconds 0))
+      (check (not (xmpp-cli/agent-routes::release-routes-lock token-b))
+             "non-owner should not release route lock")
+      (check (probe-file (xmpp-cli/agent-routes:routes-lock-pathname))
+             "route lock should remain after non-owner release")
+      (check (xmpp-cli/agent-routes::release-routes-lock token-a)
+             "owner should release route lock")
+      (check (not (probe-file (xmpp-cli/agent-routes:routes-lock-pathname)))
+             "route lock should be removed after owner release"))))
+
+(deftest route-lock-keeps-live-owner-past-stale-age
+  (with-isolated-data
+    (let ((token-a (xmpp-cli/agent-routes::make-routes-lock-token))
+          (token-b (xmpp-cli/agent-routes::make-routes-lock-token)))
+      (unwind-protect
+           (progn
+             (check (xmpp-cli/agent-routes::acquire-routes-lock token-a)
+                    "first route lock acquire should succeed")
+             (let ((lock (xmpp-cli/agent-routes::load-routes-lock)))
+               (check (xmpp-cli/util:process-exists-p (getf lock :pid))
+                      "route lock owner pid should identify a live process"))
+             (let ((xmpp-cli/agent-routes::*routes-lock-stale-seconds* -1))
+               (check-signals-error
+                 (xmpp-cli/agent-routes::acquire-routes-lock
+                  token-b
+                  :timeout-seconds 0)))
+             (check (xmpp-cli/agent-routes::routes-lock-owned-p token-a)
+                    "age alone should not steal a live owner's route lock"))
+        (xmpp-cli/agent-routes::release-routes-lock token-a)))))
+
 (deftest agent-config-cli-set-notify-to
   (with-isolated-data
     (multiple-value-bind (code events output error-output)
@@ -172,6 +214,96 @@
              "owner should delete control.yaml")
       (check (not (probe-file (xmpp-cli/agent-ipc:control-pathname)))
              "control.yaml should be removed by owner"))))
+
+(deftest daemon-request-stop-wakes-control-accept-loop
+  (let* ((server (usocket:socket-listen "127.0.0.1"
+                                        0
+                                        :reuse-address t
+                                        :element-type '(unsigned-byte 8)))
+         (state (xmpp-cli/agent-daemon::make-daemon-state
+                 :server-socket server))
+         (thread nil))
+    (unwind-protect
+         (progn
+           (setf thread
+                 (bt:make-thread
+                  (lambda ()
+                    (xmpp-cli/agent-daemon::accept-control-loop state))
+                  :name "xmpp-cli test accept loop"))
+           (sleep 0.1)
+           (xmpp-cli/agent-daemon::request-stop state)
+           (loop repeat 30
+                 while (bt:thread-alive-p thread)
+                 do (sleep 0.1))
+           (check (not (bt:thread-alive-p thread))
+                  "request-stop should close the server socket and wake accept"))
+      (ignore-errors
+        (usocket:socket-close server))
+      (when (and thread (bt:thread-alive-p thread))
+        (ignore-errors
+          (bt:destroy-thread thread))))))
+
+(deftest daemon-ipc-frame-round-trips-newline-payload
+  (let* ((body (format nil "hello~%world I~cm fine" (code-char #x2019)))
+         (message (list :op :send
+                        :token "owner-token"
+                        :body body))
+         (out (flexi-streams:make-in-memory-output-stream)))
+    (xmpp-cli/agent-ipc:write-ipc-message out message)
+    (let* ((wire (flexi-streams:get-output-stream-sequence out))
+           (newline (position 10 wire))
+           (payload-length (- (length wire) newline 1))
+           (line (map 'string #'code-char (subseq wire 0 newline)))
+           (in (flexi-streams:make-in-memory-input-stream wire)))
+      (check-equal payload-length (parse-integer line))
+      (check-equal message
+                   (xmpp-cli/agent-ipc:read-ipc-message in)))))
+
+(deftest daemon-ipc-rejects-invalid-frame-lengths
+  (check-signals-error
+    (xmpp-cli/agent-ipc::parse-ipc-length "-1"))
+  (check-signals-error
+    (xmpp-cli/agent-ipc::parse-ipc-length
+     (princ-to-string
+      (1+ xmpp-cli/agent-ipc::*max-ipc-frame-octets*))))
+  (let* ((line (format nil "~d~%" (1+ xmpp-cli/agent-ipc::*max-ipc-frame-octets*)))
+         (octets (xmpp-cli/util:utf-8-octets line))
+         (in (flexi-streams:make-in-memory-input-stream octets)))
+    (check-signals-error
+      (xmpp-cli/agent-ipc:read-ipc-message in))))
+
+(deftest daemon-send-rejects-mismatched-profile-digest
+  (let* ((profile (list :jid "user@example.org"
+                        :password "secret"))
+         (digest (xmpp-cli/agent-ipc:profile-digest profile))
+         (state (xmpp-cli/agent-daemon::make-daemon-state
+                 :profile-name "default"
+                 :profile profile
+                 :control (list :profile-digest digest)
+                 :token "owner-token")))
+    (dolist (expected '(nil "other-digest"))
+      (let ((response
+              (xmpp-cli/agent-daemon::handle-control-request
+               state
+               (list :token "owner-token"
+                     :op :send
+                     :to "friend@example.org"
+                     :body "hello"
+                     :expected-profile-digest expected))))
+        (check (not (getf response :ok))
+               "mismatched daemon profile digest should reject send")
+        (check (search "profile" (getf response :error))
+               "profile digest mismatch should explain the rejection")))
+    (let ((response
+            (xmpp-cli/agent-daemon::handle-control-request
+             state
+             (list :token "owner-token"
+                   :op :send
+                   :to "friend@example.org"
+                   :body "hello"
+                   :expected-profile-digest digest))))
+      (check (search "connection is not ready" (getf response :error))
+             "matching digest should reach the normal send path"))))
 
 (deftest json-parser-basic-object
   (let ((payload (xmpp-cli/json:parse-json

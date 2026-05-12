@@ -106,3 +106,21 @@
       (check-equal :send-text (caar events))
       (check (search "warning: could not record send history" error-output)
              "history persistence failure should emit a warning."))))
+
+(deftest cli-daemon-profile-compatibility-requires-current-profile-digest
+  (with-isolated-data
+    (let* ((profile (test-profile))
+           (other-profile (copy-list profile)))
+      (setf (getf other-profile :jid) "other@example.org")
+      (xmpp-cli/agent-ipc:save-control
+       (list :host "127.0.0.1"
+             :port 12345
+             :token "owner-token"
+             :profile "default"
+             :profile-jid (getf profile :jid)
+             :profile-digest (xmpp-cli/agent-ipc:profile-digest profile)))
+      (check (xmpp-cli/cli::daemon-compatible-profile-p "default" profile)
+             "daemon should match the same profile digest")
+      (check (not (xmpp-cli/cli::daemon-compatible-profile-p "default"
+                                                             other-profile))
+             "daemon should not match a relogged different account"))))

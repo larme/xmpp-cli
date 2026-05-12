@@ -160,20 +160,29 @@
               condition)
       nil)))
 
-(defun daemon-compatible-profile-p (profile-name)
+(defun daemon-compatible-profile-p (profile-name profile-plist)
   (handler-case
-      (let ((agent-profile (getf (load-agent-config) :profile "default")))
-        (string= profile-name agent-profile))
+      (let ((agent-profile (getf (load-agent-config) :profile "default"))
+            (control (load-control)))
+        (and control
+             (string= profile-name agent-profile)
+             (string= profile-name (getf control :profile))
+             (string= (profile-digest profile-plist)
+                      (getf control :profile-digest))))
     (error ()
       nil)))
 
 (defun send-message-with-fallback (profile-name profile-plist recipient body)
   "Return TRANSPORT and ERROR. TRANSPORT is :DAEMON or :STANDALONE on success."
-  (when (daemon-compatible-profile-p profile-name)
-    (multiple-value-bind (ok response error) (daemon-send recipient body)
-      (declare (ignore response error))
-      (when ok
-        (return-from send-message-with-fallback (values :daemon nil)))))
+  (let ((expected-profile-digest (profile-digest profile-plist)))
+    (when (daemon-compatible-profile-p profile-name profile-plist)
+      (multiple-value-bind (ok response error)
+          (daemon-send recipient
+                       body
+                       :expected-profile-digest expected-profile-digest)
+        (declare (ignore response error))
+        (when ok
+          (return-from send-message-with-fallback (values :daemon nil))))))
   (let ((send-error
           (handler-case
               (progn
@@ -350,6 +359,8 @@
       (ok
        (format t "daemon: running~%")
        (format t "profile: ~a~%" (getf response :profile))
+       (when (getf response :profile-jid)
+         (format t "profile_jid: ~a~%" (getf response :profile-jid)))
        (format t "control: ~a:~a~%"
                (getf response :control-host)
                (getf response :control-port))
