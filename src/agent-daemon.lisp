@@ -141,29 +141,61 @@
       (paste-text-and-enter route text)
       (focus-pane route)))
 
-(defun handle-route-reply (state from code text)
-  (let ((route (find-active-route-by-code code (route-ttl-days state))))
-    (cond
-      ((null route)
-       (send-daemon-note state
-                         from
-                         (format nil "xmpp-cli: unknown route code ~a" code)))
-      (t
-       (handler-case
-           (progn
-             (apply-route-reply route text)
-             (mark-route-used route)
-             (send-daemon-note
-              state
-              from
-              (if (plusp (length text))
-                  (format nil "xmpp-cli: sent feedback to ~a" (getf route :code))
-                  (format nil "xmpp-cli: focused ~a" (getf route :code)))))
-         (error (condition)
-           (send-daemon-note
-            state
-            from
-            (format nil "xmpp-cli: route ~a failed: ~a" code condition))))))))
+(defun reply-text (body)
+  (string-trim *reply-whitespace* (or body "")))
+
+(defun active-routes-for-state (state)
+  (load-active-routes :route-ttl-days (route-ttl-days state)))
+
+(defun resolve-route-reply (state body)
+  (let ((message (reply-text body)))
+    (when (plusp (length message))
+      (let* ((routes (active-routes-for-state state))
+             (ttl-days (route-ttl-days state)))
+        (multiple-value-bind (candidate-code candidate-text)
+            (parse-agent-reply message)
+          (let ((explicit-route (and candidate-code
+                                     (find-route-by-code candidate-code
+                                                         routes
+                                                         ttl-days))))
+            (if explicit-route
+                (values explicit-route candidate-text nil)
+                (let ((default-route (last-active-route routes)))
+                  (when default-route
+                    (values default-route message t))))))))))
+
+(defun route-reply-success-message (route text default-route-p)
+  (let ((suffix (if default-route-p " (default route)" "")))
+    (if (plusp (length text))
+        (format nil "xmpp-cli: sent feedback to ~a~a" (getf route :code) suffix)
+        (format nil "xmpp-cli: focused ~a~a" (getf route :code) suffix))))
+
+(defun handle-resolved-route-reply (state from route text default-route-p)
+  (handler-case
+      (progn
+        (apply-route-reply route text)
+        (mark-route-used route)
+        (send-daemon-note
+         state
+         from
+         (route-reply-success-message route text default-route-p)))
+    (error (condition)
+      (send-daemon-note
+       state
+       from
+       (format nil "xmpp-cli: route ~a failed: ~a"
+               (getf route :code)
+               condition)))))
+
+(defun handle-route-reply (state from body)
+  (multiple-value-bind (route text default-route-p)
+      (resolve-route-reply state body)
+    (if route
+        (handle-resolved-route-reply state from route text default-route-p)
+        (send-daemon-note
+         state
+         from
+         "xmpp-cli: no active route; wait for a Codex notification or prepend a route code."))))
 
 (defun handle-incoming-message (state message)
   (let ((from (getf message :from))
@@ -175,9 +207,7 @@
                  "~&xmpp-cli daemon: ignored message from unauthorized sender ~a~%"
                  (or from "<unknown>")))
         (t
-         (multiple-value-bind (code text) (parse-agent-reply body)
-           (when code
-             (handle-route-reply state from code text))))))))
+         (handle-route-reply state from body))))))
 
 (defun sleep-until-stop (state seconds)
   (loop repeat seconds

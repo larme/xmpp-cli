@@ -122,6 +122,7 @@
    #:ensure-route
    #:find-route-by-code
    #:find-active-route-by-code
+   #:last-active-route
    #:route-expired-p
    #:mark-route-used))
 
@@ -217,7 +218,8 @@
                 #:allowed-senders)
   (:import-from #:xmpp-cli/agent-routes
                 #:load-active-routes
-                #:find-active-route-by-code
+                #:find-route-by-code
+                #:last-active-route
                 #:mark-route-used)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane

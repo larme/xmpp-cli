@@ -163,6 +163,10 @@ Notification headers include the route code, event, hostname, repository
 location, current working directory, and tool name when Codex is waiting for
 approval.
 
+When replying from XMPP, prefix a route code to target a specific Codex pane.
+If the message does not start with an active route code, the daemon sends it to
+the most recently active route.
+
 ## Tests
 
 The test system covers JID parsing, config round trips, history metadata, CLI validation, and CLI send behavior through a fake backend.

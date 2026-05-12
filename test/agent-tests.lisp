@@ -253,6 +253,42 @@
                (xmpp-cli/agent-daemon:bare-jid
                 "user@example.org/phone")))
 
+(deftest agent-reply-without-code-uses-last-active-route
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-a"
+                          :code "aaaa"
+                          :identity "route-a"
+                          :created-at older
+                          :last-seen-at older
+                          :last-used-at nil))
+           (route-b (list :route-id "route-b"
+                          :code "bbbb"
+                          :identity "route-b"
+                          :created-at older
+                          :last-seen-at newer
+                          :last-used-at nil))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (multiple-value-bind (route text default-route-p)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "please rerun the failing test")
+        (check-equal "bbbb" (getf route :code))
+        (check-equal "please rerun the failing test" text)
+        (check default-route-p
+               "reply without a route code should use the last active route"))
+      (multiple-value-bind (route text default-route-p)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "AaAa focus this panel")
+        (check-equal "aaaa" (getf route :code))
+        (check-equal "focus this panel" text)
+        (check (not default-route-p)
+               "reply with an active route code should stay explicit")))))
+
 (deftest codex-notification-allocates-route-code
   (with-isolated-data
     (let* ((cwd (namestring (uiop:getcwd)))

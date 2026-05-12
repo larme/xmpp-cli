@@ -154,6 +154,15 @@
                                '(:last-used-at :last-seen-at :created-at)))))
     (and times (reduce #'max times))))
 
+(defun last-active-route (&optional (routes (load-routes)))
+  (let ((best nil)
+        (best-time nil))
+    (dolist (route routes best)
+      (let ((time (or (route-activity-time route) 0)))
+        (when (or (null best) (> time best-time))
+          (setf best route
+                best-time time))))))
+
 (defun route-expired-p (route ttl-days &optional (now (get-universal-time)))
   (and ttl-days
        (let ((activity-time (route-activity-time route)))
