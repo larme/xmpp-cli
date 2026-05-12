@@ -81,14 +81,17 @@
     (setf (daemon-state-connected-at state) nil)
     (setf (daemon-state-last-error state) error-text)))
 
-(defun route-count ()
+(defun route-ttl-days (state)
+  (getf (daemon-state-agent-config state) :route-ttl-days))
+
+(defun route-count (state)
   (handler-case
-      (length (load-routes))
+      (length (load-active-routes :route-ttl-days (route-ttl-days state)))
     (error ()
       nil)))
 
 (defun status-plist (state)
-  (let ((routes (route-count)))
+  (let ((routes (route-count state)))
     (bt:with-lock-held ((daemon-state-lock state))
       (let ((control (daemon-state-control state)))
         (list :ok t
@@ -139,7 +142,7 @@
       (focus-pane route)))
 
 (defun handle-route-reply (state from code text)
-  (let ((route (find-route-by-code code)))
+  (let ((route (find-active-route-by-code code (route-ttl-days state))))
     (cond
       ((null route)
        (send-daemon-note state

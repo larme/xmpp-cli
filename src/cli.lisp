@@ -386,7 +386,10 @@
     (unless (= (length args) 1)
       (command-usage-error cmd "Usage: xmpp-cli agent focus <route-code>"))
     (let* ((code (string-downcase (first args)))
-           (route (find-route-by-code code (load-routes))))
+           (agent-config (load-agent-config))
+           (route (find-active-route-by-code
+                   code
+                   (getf agent-config :route-ttl-days))))
       (unless route
         (fail +exit-usage+ "Unknown route code: ~a" code))
       (handler-case

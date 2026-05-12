@@ -117,9 +117,12 @@
    #:route-id-for-identity
    #:random-route-code
    #:load-routes
+   #:load-active-routes
    #:save-routes
    #:ensure-route
    #:find-route-by-code
+   #:find-active-route-by-code
+   #:route-expired-p
    #:mark-route-used))
 
 (defpackage #:xmpp-cli/tmux
@@ -213,8 +216,8 @@
                 #:load-agent-config
                 #:allowed-senders)
   (:import-from #:xmpp-cli/agent-routes
-                #:load-routes
-                #:find-route-by-code
+                #:load-active-routes
+                #:find-active-route-by-code
                 #:mark-route-used)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane
@@ -294,8 +297,7 @@
                 #:daemon-status
                 #:daemon-stop)
   (:import-from #:xmpp-cli/agent-routes
-                #:load-routes
-                #:find-route-by-code)
+                #:find-active-route-by-code)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane)
   (:import-from #:xmpp-cli/agent-daemon

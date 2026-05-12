@@ -98,13 +98,99 @@
     (uiop:rename-file-overwriting-target temp target)
     target))
 
+(defun parse-fixed-integer (string start end)
+  (parse-integer string :start start :end end :junk-allowed nil))
+
+(defun parse-iso8601-timezone (timestamp position)
+  (let ((marker (and (< position (length timestamp))
+                     (char timestamp position))))
+    (cond
+      ((null marker)
+       nil)
+      ((char= marker #\Z)
+       0)
+      ((or (char= marker #\+) (char= marker #\-))
+       (let* ((hours (parse-fixed-integer timestamp
+                                          (1+ position)
+                                          (+ position 3)))
+              (minutes (parse-fixed-integer timestamp
+                                            (+ position 4)
+                                            (+ position 6)))
+              (offset (+ hours (/ minutes 60))))
+         ;; ENCODE-UNIVERSAL-TIME expects hours west of GMT. ISO-8601
+         ;; offsets use the opposite sign for locations east of GMT.
+         (if (char= marker #\+)
+             (- offset)
+             offset)))
+      (t
+       nil))))
+
+(defun parse-iso8601 (timestamp)
+  (when (and (stringp timestamp)
+             (>= (length timestamp) 19)
+             (char= (char timestamp 4) #\-)
+             (char= (char timestamp 7) #\-)
+             (char= (char timestamp 10) #\T)
+             (char= (char timestamp 13) #\:)
+             (char= (char timestamp 16) #\:))
+    (handler-case
+        (let ((year (parse-fixed-integer timestamp 0 4))
+              (month (parse-fixed-integer timestamp 5 7))
+              (day (parse-fixed-integer timestamp 8 10))
+              (hour (parse-fixed-integer timestamp 11 13))
+              (minute (parse-fixed-integer timestamp 14 16))
+              (second (parse-fixed-integer timestamp 17 19))
+              (timezone (parse-iso8601-timezone timestamp 19)))
+          (if timezone
+              (encode-universal-time second minute hour day month year timezone)
+              (encode-universal-time second minute hour day month year)))
+      (error ()
+        nil))))
+
+(defun route-activity-time (route)
+  (let ((times (remove nil
+                       (mapcar (lambda (key)
+                                 (parse-iso8601 (getf route key)))
+                               '(:last-used-at :last-seen-at :created-at)))))
+    (and times (reduce #'max times))))
+
+(defun route-expired-p (route ttl-days &optional (now (get-universal-time)))
+  (and ttl-days
+       (let ((activity-time (route-activity-time route)))
+         (or (null activity-time)
+             (> (- now activity-time)
+                (* ttl-days 24 60 60))))))
+
+(defun active-routes (routes ttl-days &optional (now (get-universal-time)))
+  (if ttl-days
+      (remove-if (lambda (route)
+                   (route-expired-p route ttl-days now))
+                 routes)
+      routes))
+
+(defun load-active-routes (&key route-ttl-days)
+  (let* ((routes (load-routes))
+         (active (active-routes routes route-ttl-days)))
+    (when (and route-ttl-days
+               (/= (length routes) (length active)))
+      (save-routes active))
+    active))
+
 (defun find-route-by-id (routes route-id)
   (find route-id routes :test #'string= :key (lambda (route)
                                                (getf route :route-id))))
 
-(defun find-route-by-code (code &optional (routes (load-routes)))
-  (find code routes :test #'route-code-equal :key (lambda (route)
-                                                    (getf route :code))))
+(defun find-route-by-code (code &optional (routes (load-routes)) route-ttl-days)
+  (let ((route (find code routes :test #'route-code-equal :key (lambda (entry)
+                                                                 (getf entry :code)))))
+    (and route
+         (not (route-expired-p route route-ttl-days))
+         route)))
+
+(defun find-active-route-by-code (code route-ttl-days)
+  (find-route-by-code code
+                      (load-active-routes :route-ttl-days route-ttl-days)
+                      route-ttl-days))
 
 (defun used-code-p (code routes)
   (find-route-by-code code routes))
@@ -137,6 +223,7 @@
 
 (defun ensure-route (identity &key
                                 (code-length 4)
+                                route-ttl-days
                                 agent
                                 agent-session
                                 host
@@ -148,7 +235,7 @@
                                 tmux-session-id
                                 tmux-window-id
                                 tmux-pane-id)
-  (let* ((routes (load-routes))
+  (let* ((routes (load-active-routes :route-ttl-days route-ttl-days))
          (route-id (route-id-for-identity identity))
          (existing (find-route-by-id routes route-id))
          (now (now-iso8601))

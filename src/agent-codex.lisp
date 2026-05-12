@@ -209,6 +209,7 @@
       (handler-case
           (ensure-route identity
                         :code-length (getf config :code-length 4)
+                        :route-ttl-days (getf config :route-ttl-days)
                         :agent :codex
                         :agent-session agent-session
                         :host host
@@ -223,16 +224,28 @@
         (error ()
           nil)))))
 
-(defun build-header (route host display-repo event)
-  (format nil "~a ~a ~a ~a"
-          (or (getf route :code) "no-route")
-          host
-          display-repo
-          (event-title event)))
+(defun permission-tool-name (payload event)
+  (when (string= event "PermissionRequest")
+    (normalize-detail (payload-value payload "tool_name" ""))))
+
+(defun build-header (route host display-repo event &optional tool-name)
+  (let ((header (format nil "~a ~a ~a ~a"
+                        (or (getf route :code) "no-route")
+                        host
+                        display-repo
+                        (event-title event))))
+    (if (and tool-name (plusp (length tool-name)))
+        (format nil "~a tool=~a" header tool-name)
+        header)))
 
 (defun notification-prefix-lines (payload route host display-repo display-cwd)
   (let* ((event (payload-value payload "hook_event_name" "Codex"))
-         (lines (list* (build-header route host display-repo event)
+         (tool-name (permission-tool-name payload event))
+         (lines (list* (build-header route
+                                      host
+                                      display-repo
+                                      event
+                                      tool-name)
                        (notification-common-lines payload))))
     (setf lines (append lines (list (format nil "cwd: ~a" display-cwd))))
     (unless route

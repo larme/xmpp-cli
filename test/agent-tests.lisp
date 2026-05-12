@@ -71,6 +71,37 @@
       (check-equal code (getf matched :code))
       (check-equal 2 (getf route-b :notify-count)))))
 
+(deftest route-ttl-prunes-expired-routes
+  (with-isolated-data
+    (let* ((now (get-universal-time))
+           (old-time (xmpp-cli/util:now-iso8601 (- now (* 2 24 60 60))))
+           (fresh-time (xmpp-cli/util:now-iso8601 now))
+           (old-route (list :route-id "old-route"
+                            :code "oldc"
+                            :identity "old"
+                            :created-at old-time
+                            :last-seen-at old-time
+                            :last-used-at nil))
+           (fresh-route (list :route-id "fresh-route"
+                              :code "newc"
+                              :identity "fresh"
+                              :created-at old-time
+                              :last-seen-at old-time
+                              :last-used-at fresh-time)))
+      (xmpp-cli/agent-routes:save-routes (list old-route fresh-route))
+      (check (null (xmpp-cli/agent-routes:find-active-route-by-code
+                    "oldc"
+                    1))
+             "expired route codes should not match")
+      (let ((matched (xmpp-cli/agent-routes:find-active-route-by-code
+                      "NEWC"
+                      1)))
+        (check-equal "newc" (getf matched :code)))
+      (check-equal '("newc")
+                   (mapcar (lambda (route)
+                             (getf route :code))
+                           (xmpp-cli/agent-routes:load-routes))))))
+
 (deftest agent-config-cli-set-notify-to
   (with-isolated-data
     (multiple-value-bind (code events output error-output)
@@ -289,6 +320,27 @@
              "notification should allocate a route from TMUX/TMUX_PANE fallback context")
       (check (not (search " NIL " body))
              "notification header should not contain printed NIL host"))))
+
+(deftest codex-permission-notification-includes-tool-name
+  (with-isolated-data
+    (let* ((config (xmpp-cli/agent-config:set-notify-to
+                    (xmpp-cli/agent-config:load-agent-config)
+                    "friend@example.org"))
+           (payload (xmpp-cli/json:parse-json
+                     "{\"hook_event_name\":\"PermissionRequest\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"cwd\":\"/tmp\",\"tool_name\":\"shell_command\",\"permission_mode\":\"default\",\"tool_input\":{\"description\":\"Run tests\",\"command\":\"make test\"}}"))
+           (notification
+             (xmpp-cli/agent-codex:build-codex-notification
+              payload
+              config
+              :tmux-context nil
+              :host "hbox"))
+           (body (xmpp-cli/agent-codex:notification-body notification)))
+      (check (search "tool=shell_command" body)
+             "permission notification header should include the tool name")
+      (check (search "permission: default" body)
+             "permission notification should include permission mode")
+      (check (search "make test" body)
+             "permission notification should include tool input detail"))))
 
 (deftest codex-notification-long-parts-repeat-route-metadata
   (with-isolated-data
