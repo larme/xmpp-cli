@@ -158,6 +158,7 @@
    #:build-codex-notification
    #:notification-target
    #:notification-body
+   #:notification-bodies
    #:notification-route))
 
 (defpackage #:xmpp-cli/backend
@@ -282,7 +283,8 @@
                 #:read-codex-payload
                 #:build-codex-notification
                 #:notification-target
-                #:notification-body)
+                #:notification-body
+                #:notification-bodies)
   (:import-from #:xmpp-cli/json
                 #:json-compact-string)
   (:import-from #:xmpp-cli/yaml

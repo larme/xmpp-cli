@@ -185,6 +185,17 @@
         (values nil send-error)
         (values :standalone nil))))
 
+(defun send-message-parts-with-fallback (profile-name profile-plist recipient bodies)
+  "Return TRANSPORT and ERROR after sending each body in BODIES."
+  (let ((last-transport nil))
+    (dolist (body bodies (values last-transport nil))
+      (multiple-value-bind (transport send-error)
+          (send-message-with-fallback profile-name profile-plist recipient body)
+        (when send-error
+          (return-from send-message-parts-with-fallback
+            (values nil send-error)))
+        (setf last-transport transport)))))
+
 (defun handle-send (cmd)
   (let* ((args (clingon:command-arguments cmd))
          (recipient (first args))
@@ -299,9 +310,13 @@
                       condition)))))
              (target (notification-target notification))
              (body (notification-body notification))
+             (bodies (notification-bodies notification))
              (send-error nil))
         (multiple-value-bind (transport error)
-            (send-message-with-fallback profile-name profile-plist target body)
+            (send-message-parts-with-fallback profile-name
+                                              profile-plist
+                                              target
+                                              bodies)
           (declare (ignore transport))
           (setf send-error error))
         (if send-error

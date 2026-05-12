@@ -10,7 +10,7 @@ import traceback
 
 
 HOME = os.path.expanduser("~")
-MAX_DETAIL_CHARS = 1600
+MAX_MESSAGE_CHARS = 1600
 SEND_TIMEOUT_SECONDS = 15
 
 
@@ -60,11 +60,50 @@ def git_root(cwd):
     return root or None
 
 
-def trim(text, limit=MAX_DETAIL_CHARS):
-    text = "" if text is None else str(text).strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "..."
+def normalize(text):
+    return "" if text is None else str(text).strip()
+
+
+def join_message(prefix_lines, detail):
+    lines = list(prefix_lines)
+    if detail:
+        lines.extend(["", detail])
+    return "\n".join(lines)
+
+
+def split_text(text, limit):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + limit)
+        if end < len(text):
+            newline = text.rfind("\n", start, end)
+            space = text.rfind(" ", start, end)
+            boundary = max(newline, space)
+            if boundary >= start + limit // 2:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def split_message(prefix_lines, detail, limit=MAX_MESSAGE_CHARS):
+    message = join_message(prefix_lines, detail)
+    if len(message) <= limit or not detail:
+        return [message]
+
+    total = 1
+    while True:
+        overhead = len("\n".join([f"[{total}/{total}]", *prefix_lines, "", ""]))
+        chunk_limit = max(1, limit - overhead)
+        chunks = split_text(detail, chunk_limit)
+        next_total = len(chunks)
+        if next_total == total:
+            return [
+                join_message([f"[{index}/{total}]", *prefix_lines], chunk)
+                for index, chunk in enumerate(chunks, 1)
+            ]
+        total = next_total
 
 
 def compact_json(value):
@@ -80,12 +119,12 @@ def summarize_tool_input(payload):
         description = tool_input.get("description")
         command = tool_input.get("command")
         if description and command:
-            return trim(f"{description}\n{command}")
+            return normalize(f"{description}\n{command}")
         if command:
-            return trim(command)
+            return normalize(command)
         if description:
-            return trim(description)
-    return trim(compact_json(tool_input))
+            return normalize(description)
+    return normalize(compact_json(tool_input))
 
 
 def payload_value(payload, key, default="unknown"):
@@ -139,7 +178,7 @@ def header(event, payload):
     return " | ".join(parts)
 
 
-def build_message(payload):
+def build_message_parts(payload):
     event = payload_value(payload, "hook_event_name", "Codex")
     model = payload_value(payload, "model")
     turn_id = payload_value(payload, "turn_id", "none")
@@ -150,25 +189,29 @@ def build_message(payload):
     ]
 
     if event == "Stop":
-        last_message = trim(payload.get("last_assistant_message"), 1800)
-        lines = [header("Codex finished", payload), *common]
-        if last_message:
-            lines.extend(["", last_message])
-        return "\n".join(lines)
+        last_message = normalize(payload.get("last_assistant_message"))
+        return [header("Codex finished", payload), *common], last_message
 
     if event == "PermissionRequest":
         permission_mode = payload_value(payload, "permission_mode")
         detail = summarize_tool_input(payload)
-        lines = [
+        return [
             header("Codex needs input", payload),
             *common,
             f"permission: {permission_mode}",
-        ]
-        if detail:
-            lines.extend(["", detail])
-        return "\n".join(lines)
+        ], detail
 
-    return "\n".join([header(f"Codex hook: {event}", payload), *common])
+    return [header(f"Codex hook: {event}", payload), *common], ""
+
+
+def build_message(payload):
+    prefix_lines, detail = build_message_parts(payload)
+    return join_message(prefix_lines, detail)
+
+
+def build_messages(payload):
+    prefix_lines, detail = build_message_parts(payload)
+    return split_message(prefix_lines, detail)
 
 
 def send_xmpp(message):
@@ -197,7 +240,8 @@ def main():
         return 0
 
     try:
-        send_xmpp(build_message(payload))
+        for message in build_messages(payload):
+            send_xmpp(message)
     except Exception as exc:
         log(f"failed to send XMPP notification: {exc}")
         log(traceback.format_exc().rstrip())

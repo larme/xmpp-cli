@@ -1,10 +1,11 @@
 (in-package #:xmpp-cli/agent-codex)
 
-(defparameter *notification-detail-limit* 1800)
+(defparameter *notification-message-limit* 1800)
 
 (defstruct notification
   target
   body
+  bodies
   route)
 
 (defun read-codex-payload (&optional (stream *standard-input*))
@@ -29,15 +30,85 @@
       (unless (or (null value) (json-null-p value))
         (return (string-value value default))))))
 
-(defun trim-detail (text &optional (limit *notification-detail-limit*))
-  (let ((value (string-trim '(#\Space #\Tab #\Newline #\Return)
-                            (or text ""))))
-    (if (<= (length value) limit)
-        value
-        (concatenate 'string
-                     (string-right-trim '(#\Space #\Tab #\Newline #\Return)
-                                        (subseq value 0 (max 0 (1- limit))))
-                     "..."))))
+(defun normalize-detail (text)
+  (string-trim '(#\Space #\Tab #\Newline #\Return)
+               (or text "")))
+
+(defun join-lines (lines)
+  (with-output-to-string (out nil :element-type 'character)
+    (loop for line in lines
+          for first = t then nil
+          do (progn
+               (unless first
+                 (terpri out))
+               (write-string line out)))))
+
+(defun split-boundary (text start limit)
+  (let* ((end (min (length text) (+ start limit)))
+         (newline (position #\Newline text
+                            :start start
+                            :end end
+                            :from-end t))
+         (space (position #\Space text
+                          :start start
+                          :end end
+                          :from-end t))
+         (candidate (or newline space))
+         (minimum-boundary (+ start (floor limit 2))))
+    (if (and candidate (>= candidate minimum-boundary))
+        (1+ candidate)
+        end)))
+
+(defun split-text (text limit)
+  (let ((chunks nil)
+        (start 0)
+        (length (length text)))
+    (loop while (< start length)
+          for end = (if (<= (- length start) limit)
+                        length
+                        (split-boundary text start limit))
+          do (progn
+               (push (subseq text start end) chunks)
+               (setf start end)))
+    (nreverse chunks)))
+
+(defun part-marker (index total)
+  (format nil "[~d/~d]" index total))
+
+(defun body-lines-with-detail (prefix-lines detail)
+  (append-non-empty-detail prefix-lines detail))
+
+(defun part-overhead (prefix-lines total)
+  (length (join-lines (append (list (part-marker total total))
+                              prefix-lines
+                              ;; One blank line separates metadata from the
+                              ;; chunk; the second placeholder accounts for
+                              ;; the newline before the chunk itself.
+                              (list "" "")))))
+
+(defun part-body (prefix-lines chunk index total)
+  (join-lines (append (list (part-marker index total))
+                      (body-lines-with-detail prefix-lines chunk))))
+
+(defun split-notification-body (prefix-lines detail
+                                &optional (limit *notification-message-limit*))
+  (let ((body (join-lines (body-lines-with-detail prefix-lines detail))))
+    (if (or (<= (length body) limit)
+            (zerop (length detail)))
+        (list body)
+        (loop with total = 1
+              for overhead = (part-overhead prefix-lines total)
+              for chunk-limit = (max 1 (- limit overhead))
+              for chunks = (split-text detail chunk-limit)
+              for next-total = (length chunks)
+              when (= next-total total)
+                return (loop for chunk in chunks
+                             for index from 1
+                             collect (part-body prefix-lines
+                                                chunk
+                                                index
+                                                total))
+              do (setf total next-total)))))
 
 (defun host-name-fallback ()
   (let ((host (ignore-errors (machine-instance))))
@@ -98,17 +169,17 @@
            (command (payload-value tool-input "command" nil)))
        (cond
          ((and description command)
-          (trim-detail (format nil "~a~%~a" description command)))
+          (normalize-detail (format nil "~a~%~a" description command)))
          (command
-          (trim-detail command))
+          (normalize-detail command))
          (description
-          (trim-detail description))
+          (normalize-detail description))
          (t
-          (trim-detail (json-compact-string tool-input))))))
+          (normalize-detail (json-compact-string tool-input))))))
     ((or (null tool-input) (json-null-p tool-input))
      "")
     (t
-     (trim-detail (json-compact-string tool-input)))))
+     (normalize-detail (json-compact-string tool-input)))))
 
 (defun notification-common-lines (payload)
   (list (format nil "model: ~a" (payload-value payload "model" "unknown"))
@@ -159,7 +230,7 @@
           display-repo
           (event-title event)))
 
-(defun build-body (payload route host display-repo display-cwd)
+(defun notification-prefix-lines (payload route host display-repo display-cwd)
   (let* ((event (payload-value payload "hook_event_name" "Codex"))
          (lines (list* (build-header route host display-repo event)
                        (notification-common-lines payload))))
@@ -168,18 +239,27 @@
       (setf lines (append lines
                           (list "route: unavailable (not running inside tmux)"))))
     (cond
-      ((string= event "Stop")
-       (append-non-empty-detail
-        lines
-        (trim-detail (payload-value payload "last_assistant_message" ""))))
       ((string= event "PermissionRequest")
-       (let ((permission-mode (payload-value payload "permission_mode" "unknown"))
-             (detail (summarize-tool-input (json-value payload "tool_input"))))
-         (append-non-empty-detail
-          (append lines (list (format nil "permission: ~a" permission-mode)))
-          detail)))
+       (append lines
+               (list (format nil "permission: ~a"
+                             (payload-value payload
+                                            "permission_mode"
+                                            "unknown")))))
       (t
        lines))))
+
+(defun notification-detail (payload)
+  (let ((event (payload-value payload "hook_event_name" "Codex")))
+    (cond
+      ((string= event "Stop")
+       (normalize-detail (payload-value payload "last_assistant_message" "")))
+      ((string= event "PermissionRequest")
+       (summarize-tool-input (json-value payload "tool_input")))
+      (t
+       ""))))
+
+(defun build-body (prefix-lines detail)
+  (join-lines (body-lines-with-detail prefix-lines detail)))
 
 (defun build-codex-notification (payload config &key tmux-context host cwd)
   (let* ((target (notify-to config))
@@ -192,7 +272,14 @@
          (display-cwd (display-path cwd))
          (context (or tmux-context (capture-context)))
          (route (route-for-context context payload config host cwd display-cwd))
-         (body-lines (build-body payload route host display-repo display-cwd)))
+         (prefix-lines (notification-prefix-lines payload
+                                                  route
+                                                  host
+                                                  display-repo
+                                                  display-cwd))
+         (detail (notification-detail payload))
+         (body (build-body prefix-lines detail)))
     (make-notification :target target
-                       :body (format nil "~{~a~^~%~}" body-lines)
+                       :body body
+                       :bodies (split-notification-body prefix-lines detail)
                        :route route)))

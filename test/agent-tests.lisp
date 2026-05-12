@@ -290,6 +290,46 @@
       (check (not (search " NIL " body))
              "notification header should not contain printed NIL host"))))
 
+(deftest codex-notification-long-parts-repeat-route-metadata
+  (with-isolated-data
+    (let* ((config (xmpp-cli/agent-config:set-notify-to
+                    (xmpp-cli/agent-config:load-agent-config)
+                    "friend@example.org"))
+           (detail (make-string 5000 :initial-element #\Z))
+           (payload (xmpp-cli/json:parse-json
+                     (format nil
+                             "{\"hook_event_name\":\"Stop\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"session_id\":\"session-1\",\"cwd\":\"/tmp\",\"last_assistant_message\":\"~a\"}"
+                             detail)))
+           (context (list :tmux-socket "/tmp/tmux-1000/default"
+                          :tmux-client-name "/dev/pts/45"
+                          :tmux-client-tty "/dev/pts/45"
+                          :tmux-session-id "$1"
+                          :tmux-window-id "@3"
+                          :tmux-pane-id "%12"))
+           (notification
+             (xmpp-cli/agent-codex:build-codex-notification
+              payload
+              config
+              :tmux-context context
+              :host "hbox"))
+           (route (xmpp-cli/agent-codex:notification-route notification))
+           (code (getf route :code))
+           (bodies (xmpp-cli/agent-codex:notification-bodies notification)))
+      (check (< 1 (length bodies))
+             "long routed notifications should be split")
+      (check (every (lambda (body)
+                      (and (search (format nil "~a hbox " code) body)
+                           (search "codex finished" body)
+                           (search "model: gpt-test" body)
+                           (search "turn: turn-1" body)
+                           (search "cwd: /tmp" body)
+                           (<= (length body) 1800)))
+                    bodies)
+             "every split notification part should repeat route and metadata")
+      (check-equal 5000
+                   (loop for body in bodies
+                         sum (count #\Z body))))))
+
 (deftest cli-agent-notify-codex-sends-with-fake-backend
   (with-isolated-data
     (save-default-test-profile)
@@ -331,6 +371,43 @@
           (check-equal :send-text event)
           (check (search (format nil "I~Cm fine" (code-char #x2019)) body)
                  "notification body should preserve Unicode punctuation"))))))
+
+(deftest cli-agent-notify-codex-sends-long-message-in-parts
+  (with-isolated-data
+    (save-default-test-profile)
+    (xmpp-cli/agent-config:save-agent-config
+     (xmpp-cli/agent-config:set-notify-to
+      (xmpp-cli/agent-config:load-agent-config)
+      "friend@example.org"))
+    (let* ((detail (make-string 5000 :initial-element #\Z))
+           (payload (format nil
+                            "{\"hook_event_name\":\"Stop\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"cwd\":\"/tmp\",\"last_assistant_message\":\"~a\"}"
+                            detail)))
+      (multiple-value-bind (code events output error-output)
+          (run-cli '("agent" "notify-codex") :input payload)
+        (declare (ignore output error-output))
+        (check-equal 0 code)
+        (check (< 1 (length events))
+               "long Codex messages should be sent as multiple XMPP messages")
+        (check (every (lambda (event)
+                        (destructuring-bind (kind profile to body) event
+                          (declare (ignore profile))
+                          (and (eq kind :send-text)
+                               (string= to "friend@example.org")
+                               (search "codex finished" body)
+                               (search "model: gpt-test" body)
+                               (search "turn: turn-1" body)
+                               (search "cwd: /tmp" body)
+                               (<= (length body) 1800))))
+                      events)
+               "each notification part should repeat metadata and stay within the message limit")
+        (check-equal 5000
+                     (loop for event in events
+                           sum (count #\Z (fourth event))))
+        (check (notany (lambda (event)
+                         (search "..." (fourth event)))
+                       events)
+               "long Codex messages should not be truncated with ellipses")))))
 
 (deftest cli-agent-notify-codex-missing-profile-is-best-effort
   (with-isolated-data
