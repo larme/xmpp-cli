@@ -28,6 +28,39 @@
    #:yaml-null
    #:yaml-null-p))
 
+(defpackage #:xmpp-cli/persistence
+  (:use #:cl)
+  (:import-from #:xmpp-cli/yaml
+                #:write-yaml-file)
+  (:export
+   #:proper-plist-p
+   #:keyword-to-yaml-key
+   #:yaml-key-to-keyword
+   #:plist-to-yaml
+   #:yaml-to-plist
+   #:temporary-sibling-pathname
+   #:write-yaml-atomically))
+
+(defpackage #:xmpp-cli/file-lock
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:now-iso8601
+                #:current-process-id
+                #:process-exists-p)
+  (:import-from #:xmpp-cli/yaml
+                #:emit-yaml
+                #:read-yaml-file
+                #:yaml-value)
+  (:export
+   #:load-file-lock
+   #:try-acquire-file-lock
+   #:file-lock-owned-p
+   #:release-file-lock
+   #:delete-file-lock
+   #:file-lock-stale-p
+   #:acquire-file-lock
+   #:call-with-file-lock))
+
 (defpackage #:xmpp-cli/json
   (:use #:cl)
   (:export
@@ -42,14 +75,16 @@
   (:import-from #:xmpp-cli/util
                 #:home-xmpp-cli-directory
                 #:ensure-private-directory
-                #:write-private-file
                 #:split-jid)
   (:import-from #:xmpp-cli/yaml
-                #:emit-yaml
                 #:read-yaml-file
-                #:write-yaml-file
                 #:yaml-value
                 #:yaml-null-p)
+  (:import-from #:xmpp-cli/persistence
+                #:proper-plist-p
+                #:plist-to-yaml
+                #:yaml-to-plist
+                #:write-yaml-atomically)
   (:export
    #:*default-profile-name*
    #:load-config
@@ -64,15 +99,15 @@
   (:import-from #:xmpp-cli/util
                 #:home-xmpp-cli-directory
                 #:ensure-private-directory
-                #:write-private-file
-                #:now-iso8601
-                #:sha256-hex
-                #:utf-8-byte-length)
+                #:now-iso8601)
   (:import-from #:xmpp-cli/yaml
                 #:read-yaml-file
-                #:write-yaml-file
                 #:yaml-value
                 #:yaml-null-p)
+  (:import-from #:xmpp-cli/persistence
+                #:plist-to-yaml
+                #:yaml-to-plist
+                #:write-yaml-atomically)
   (:export
    #:append-history
    #:history-pathname))
@@ -84,12 +119,13 @@
                 #:ensure-private-directory
                 #:split-jid)
   (:import-from #:xmpp-cli/yaml
-                #:emit-yaml
                 #:read-yaml-file
-                #:write-yaml-file
                 #:yaml-value)
+  (:import-from #:xmpp-cli/persistence
+                #:write-yaml-atomically)
   (:export
    #:agent-directory
+   #:ensure-agent-directory
    #:agent-config-pathname
    #:load-agent-config
    #:save-agent-config
@@ -103,20 +139,22 @@
 (defpackage #:xmpp-cli/agent-routes
   (:use #:cl)
   (:import-from #:xmpp-cli/util
-                #:home-xmpp-cli-directory
-                #:ensure-private-directory
-                #:read-file-as-string
                 #:now-iso8601
-                #:current-process-id
-                #:process-exists-p
                 #:sha256-hex)
+  (:import-from #:xmpp-cli/agent-config
+                #:agent-directory
+                #:ensure-agent-directory)
   (:import-from #:xmpp-cli/yaml
-                #:emit-yaml
                 #:read-yaml-file
-                #:write-yaml-file
                 #:yaml-value
                 #:yaml-null
                 #:yaml-null-p)
+  (:import-from #:xmpp-cli/persistence
+                #:plist-to-yaml
+                #:yaml-to-plist
+                #:write-yaml-atomically)
+  (:import-from #:xmpp-cli/file-lock
+                #:call-with-file-lock)
   (:export
    #:routes-pathname
    #:routes-lock-pathname
@@ -187,16 +225,21 @@
   (:use #:cl)
   (:import-from #:xmpp-cli/util
                 #:ensure-private-directory
-                #:now-iso8601
                 #:sha256-hex
                 #:utf-8-octets)
   (:import-from #:xmpp-cli/yaml
-                #:emit-yaml
                 #:read-yaml-file
-                #:write-yaml-file
                 #:yaml-value)
   (:import-from #:xmpp-cli/agent-config
                 #:agent-directory)
+  (:import-from #:xmpp-cli/persistence
+                #:write-yaml-atomically)
+  (:import-from #:xmpp-cli/file-lock
+                #:load-file-lock
+                #:try-acquire-file-lock
+                #:file-lock-owned-p
+                #:release-file-lock
+                #:delete-file-lock)
   (:export
    #:control-pathname
    #:daemon-lock-pathname
@@ -248,7 +291,6 @@
                 #:receive-connected-message-loop
                 #:close-connection)
   (:import-from #:xmpp-cli/agent-ipc
-                #:load-control
                 #:load-daemon-lock
                 #:daemon-lock-pathname
                 #:save-control
@@ -258,7 +300,6 @@
                 #:delete-stale-daemon-lock
                 #:make-control-token
                 #:profile-digest
-                #:read-ipc-message
                 #:read-ipc-message-with-timeout
                 #:write-ipc-message
                 #:make-ipc-stream
@@ -280,13 +321,37 @@
   (:export
    #:make-backend))
 
+(defpackage #:xmpp-cli/sender
+  (:use #:cl)
+  (:import-from #:xmpp-cli/util
+                #:sha256-hex
+                #:utf-8-byte-length)
+  (:import-from #:xmpp-cli/history
+                #:append-history)
+  (:import-from #:xmpp-cli/agent-config
+                #:load-agent-config)
+  (:import-from #:xmpp-cli/agent-ipc
+                #:load-control
+                #:daemon-send
+                #:profile-digest)
+  (:import-from #:xmpp-cli/backend
+                #:check-login
+                #:send-text)
+  (:export
+   #:*backend-factory*
+   #:make-backend
+   #:check-profile-login
+   #:append-send-history
+   #:maybe-append-send-history
+   #:daemon-compatible-profile-p
+   #:send-message-with-fallback
+   #:send-message-parts-with-fallback))
+
 (defpackage #:xmpp-cli/cli
   (:use #:cl)
   (:import-from #:xmpp-cli/util
                 #:read-file-as-string
-                #:split-jid
-                #:sha256-hex
-                #:utf-8-byte-length)
+                #:split-jid)
   (:import-from #:xmpp-cli/state
                 #:*default-profile-name*
                 #:load-config
@@ -294,8 +359,6 @@
                 #:profile
                 #:set-profile
                 #:default-profile-name)
-  (:import-from #:xmpp-cli/history
-                #:append-history)
   (:import-from #:xmpp-cli/agent-config
                 #:load-agent-config
                 #:save-agent-config
@@ -315,20 +378,21 @@
   (:import-from #:xmpp-cli/yaml
                 #:emit-yaml)
   (:import-from #:xmpp-cli/agent-ipc
-                #:load-control
-                #:daemon-send
                 #:daemon-status
-                #:daemon-stop
-                #:profile-digest)
+                #:daemon-stop)
+  (:import-from #:xmpp-cli/sender
+                #:make-backend
+                #:check-profile-login
+                #:maybe-append-send-history
+                #:append-send-history
+                #:send-message-with-fallback
+                #:send-message-parts-with-fallback)
   (:import-from #:xmpp-cli/agent-routes
                 #:find-active-route-by-code)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane)
   (:import-from #:xmpp-cli/agent-daemon
                 #:run-daemon)
-  (:import-from #:xmpp-cli/backend
-                #:check-login
-                #:send-text)
   (:export
    #:run))
 

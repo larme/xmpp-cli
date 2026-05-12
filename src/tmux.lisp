@@ -194,8 +194,7 @@
     (list :tmux-socket (first-tmux-field tmux-env)
           :tmux-pane-id pane)))
 
-(defun run-tmux (arguments &key input socket)
-  (declare (ignore input))
+(defun run-tmux (arguments &key socket)
   (let ((command (tmux-command arguments socket)))
     ;; Non-LispWorks implementations keep the portable UIOP path. LispWorks
     ;; delivery uses RUN-COMMAND-LISPWORKS for the reasons documented above.

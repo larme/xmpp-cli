@@ -33,7 +33,7 @@
 
 (defun run-cli (argv &key (input ""))
   (let ((*fake-events* nil)
-        (xmpp-cli/cli::*backend-factory* (lambda () (make-instance 'fake-backend))))
+        (xmpp-cli/sender:*backend-factory* (lambda () (make-instance 'fake-backend))))
     (with-input-from-string (*standard-input* input)
       (let ((*standard-output* (make-string-output-stream))
             (*error-output* (make-string-output-stream)))
@@ -119,8 +119,8 @@
              :profile "default"
              :profile-jid (getf profile :jid)
              :profile-digest (xmpp-cli/agent-ipc:profile-digest profile)))
-      (check (xmpp-cli/cli::daemon-compatible-profile-p "default" profile)
+      (check (xmpp-cli/sender:daemon-compatible-profile-p "default" profile)
              "daemon should match the same profile digest")
-      (check (not (xmpp-cli/cli::daemon-compatible-profile-p "default"
-                                                             other-profile))
+      (check (not (xmpp-cli/sender:daemon-compatible-profile-p "default"
+                                                               other-profile))
              "daemon should not match a relogged different account"))))

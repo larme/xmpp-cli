@@ -77,6 +77,10 @@
       (setf (aref result index)
             (logxor (aref left index) (aref right index))))))
 
+(defun make-scram-client-nonce ()
+  (string-downcase
+   (ironclad:byte-array-to-hex-string (ironclad:random-data 18))))
+
 (defun make-scram-client-final-message (password
                                         client-nonce
                                         client-first-bare
@@ -170,7 +174,7 @@
   (xmpp:receive-stanza connection :dom-repr t))
 
 (defun scram-sha-1-authenticate (connection username password)
-  (let ((client-nonce (cl-scram:gen-client-nonce)))
+  (let ((client-nonce (make-scram-client-nonce)))
     (multiple-value-bind (client-first-message client-first-bare)
         (make-scram-client-first-message username client-nonce)
       (send-sasl-auth connection "SCRAM-SHA-1" client-first-message)

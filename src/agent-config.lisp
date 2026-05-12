@@ -8,9 +8,6 @@
 (defun agent-config-pathname ()
   (merge-pathnames "config.yaml" (agent-directory)))
 
-(defun agent-config-temp-pathname ()
-  (merge-pathnames "config.yaml.tmp" (agent-directory)))
-
 (defun empty-agent-config ()
   (list :profile "default"
         :notify-to nil
@@ -113,11 +110,7 @@
 (defun save-agent-config (config)
   (validate-agent-config config)
   (ensure-agent-directory)
-  (let ((temp (agent-config-temp-pathname))
-        (target (agent-config-pathname)))
-    (write-yaml-file temp (config-to-yaml config))
-    (uiop:rename-file-overwriting-target temp target)
-    target))
+  (write-yaml-atomically (agent-config-pathname) (config-to-yaml config)))
 
 (defun notify-to (config)
   (getf config :notify-to))

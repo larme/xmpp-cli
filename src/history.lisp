@@ -3,16 +3,8 @@
 (defun history-pathname ()
   (merge-pathnames "history.yaml" (home-xmpp-cli-directory)))
 
-(defun history-temp-pathname ()
-  (merge-pathnames "history.yaml.tmp" (home-xmpp-cli-directory)))
-
-(defun keyword-to-yaml-key (keyword)
-  (substitute #\_ #\- (string-downcase (symbol-name keyword))))
-
-(defun yaml-key-to-keyword (key)
-  (intern (string-upcase (substitute #\- #\_ key)) :keyword))
-
-(defun history-value-to-yaml (value)
+(defun history-value-to-yaml (key value)
+  (declare (ignore key))
   (if (keywordp value)
       (string-downcase (symbol-name value))
       value))
@@ -26,16 +18,12 @@
     (t value)))
 
 (defun history-entry-to-yaml (entry)
-  (loop for (key value) on entry by #'cddr
-        collect (cons (keyword-to-yaml-key key)
-                      (history-value-to-yaml value))))
+  (plist-to-yaml entry :value-to-yaml #'history-value-to-yaml))
 
 (defun yaml-to-history-entry (mapping)
   (unless (listp mapping)
     (error "Malformed history.yaml: history entry must be a mapping."))
-  (loop for (key . value) in mapping
-        append (list (yaml-key-to-keyword key)
-                     (yaml-value-to-history-value key value))))
+  (yaml-to-plist mapping :value-from-yaml #'yaml-value-to-history-value))
 
 (defun history-to-yaml (history)
   (list (cons "entries" (mapcar #'history-entry-to-yaml history))))
@@ -59,11 +47,7 @@
 
 (defun save-history (history)
   (ensure-private-directory)
-  (let ((temp (history-temp-pathname))
-        (target (history-pathname)))
-    (write-yaml-file temp (history-to-yaml history))
-    (uiop:rename-file-overwriting-target temp target)
-    target))
+  (write-yaml-atomically (history-pathname) (history-to-yaml history)))
 
 (defun append-history (&key profile to kind body bytes sha256 result error)
   (declare (ignore body))

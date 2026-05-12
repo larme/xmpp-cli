@@ -104,45 +104,86 @@
 
 (deftest route-lock-is-exclusive-and-temp-paths-are-unique
   (with-isolated-data
-    (let ((temp-a (xmpp-cli/agent-routes::routes-temp-pathname))
-          (temp-b (xmpp-cli/agent-routes::routes-temp-pathname))
-          (token-a (xmpp-cli/agent-routes::make-routes-lock-token))
-          (token-b (xmpp-cli/agent-routes::make-routes-lock-token)))
+    (let ((temp-a (xmpp-cli/persistence:temporary-sibling-pathname
+                   (xmpp-cli/agent-routes:routes-pathname)))
+          (temp-b (xmpp-cli/persistence:temporary-sibling-pathname
+                   (xmpp-cli/agent-routes:routes-pathname)))
+          (token-a "route-lock-a")
+          (token-b "route-lock-b")
+          (lock-path (xmpp-cli/agent-routes:routes-lock-pathname)))
+      (xmpp-cli/agent-config:ensure-agent-directory)
       (check (not (equal (namestring temp-a) (namestring temp-b)))
              "route temp paths should be unique")
-      (check (xmpp-cli/agent-routes::acquire-routes-lock token-a)
+      (check (xmpp-cli/file-lock:acquire-file-lock
+              lock-path
+              token-a
+              :timeout-seconds 0
+              :stale-seconds xmpp-cli/agent-routes::*routes-lock-stale-seconds*
+              :use-mtime-p t
+              :label "agent route lock")
              "first route lock acquire should succeed")
       (check-signals-error
-        (xmpp-cli/agent-routes::acquire-routes-lock token-b
-                                                    :timeout-seconds 0))
-      (check (not (xmpp-cli/agent-routes::release-routes-lock token-b))
+        (xmpp-cli/file-lock:acquire-file-lock
+         lock-path
+         token-b
+         :timeout-seconds 0
+         :stale-seconds xmpp-cli/agent-routes::*routes-lock-stale-seconds*
+         :use-mtime-p t
+         :label "agent route lock"))
+      (check (not (xmpp-cli/file-lock:release-file-lock
+                   lock-path
+                   token-b
+                   :label "agent/routes.lock"))
              "non-owner should not release route lock")
       (check (probe-file (xmpp-cli/agent-routes:routes-lock-pathname))
              "route lock should remain after non-owner release")
-      (check (xmpp-cli/agent-routes::release-routes-lock token-a)
+      (check (xmpp-cli/file-lock:release-file-lock
+              lock-path
+              token-a
+              :label "agent/routes.lock")
              "owner should release route lock")
       (check (not (probe-file (xmpp-cli/agent-routes:routes-lock-pathname)))
              "route lock should be removed after owner release"))))
 
 (deftest route-lock-keeps-live-owner-past-stale-age
   (with-isolated-data
-    (let ((token-a (xmpp-cli/agent-routes::make-routes-lock-token))
-          (token-b (xmpp-cli/agent-routes::make-routes-lock-token)))
+    (let ((token-a "route-lock-a")
+          (token-b "route-lock-b")
+          (lock-path (xmpp-cli/agent-routes:routes-lock-pathname)))
+      (xmpp-cli/agent-config:ensure-agent-directory)
       (unwind-protect
            (progn
-             (check (xmpp-cli/agent-routes::acquire-routes-lock token-a)
+             (check (xmpp-cli/file-lock:acquire-file-lock
+                     lock-path
+                     token-a
+                     :timeout-seconds 0
+                     :stale-seconds xmpp-cli/agent-routes::*routes-lock-stale-seconds*
+                     :use-mtime-p t
+                     :label "agent route lock")
                     "first route lock acquire should succeed")
-             (let ((lock (xmpp-cli/agent-routes::load-routes-lock)))
+             (let ((lock (xmpp-cli/file-lock:load-file-lock
+                          lock-path
+                          :label "agent/routes.lock")))
                (check (xmpp-cli/util:process-exists-p (getf lock :pid))
                       "route lock owner pid should identify a live process"))
              (let ((xmpp-cli/agent-routes::*routes-lock-stale-seconds* -1))
                (check-signals-error
-                 (xmpp-cli/agent-routes::acquire-routes-lock
+                 (xmpp-cli/file-lock:acquire-file-lock
+                  lock-path
                   token-b
-                  :timeout-seconds 0)))
-             (check (xmpp-cli/agent-routes::routes-lock-owned-p token-a)
+                  :timeout-seconds 0
+                  :stale-seconds xmpp-cli/agent-routes::*routes-lock-stale-seconds*
+                  :use-mtime-p t
+                  :label "agent route lock")))
+             (check (xmpp-cli/file-lock:file-lock-owned-p
+                     lock-path
+                     token-a
+                     :label "agent/routes.lock")
                     "age alone should not steal a live owner's route lock"))
-        (xmpp-cli/agent-routes::release-routes-lock token-a)))))
+        (xmpp-cli/file-lock:release-file-lock
+         lock-path
+         token-a
+         :label "agent/routes.lock")))))
 
 (deftest agent-config-cli-set-notify-to
   (with-isolated-data

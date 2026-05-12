@@ -10,7 +10,6 @@
   :depends-on ("clingon"
                "cl-base64"
                "cl-xmpp/tls"
-               "cl-scram"
                "com.inuoe.jzon"
                "bordeaux-threads"
                "flexi-streams"
@@ -25,6 +24,8 @@
     ((:file "package")
      (:file "util")
      (:file "yaml")
+     (:file "persistence")
+     (:file "file-lock")
      (:file "json")
      (:file "state")
      (:file "history")
@@ -34,8 +35,12 @@
      (:file "agent-codex")
      (:file "xmpp-backend")
      (:file "agent-ipc")
+     (:file "agent-daemon-state")
+     (:file "agent-replies")
+     (:file "agent-control")
      (:file "agent-daemon")
      (:file "xmpp-cl-xmpp")
+     (:file "sender")
      (:file "cli")
      (:file "main")))))
 

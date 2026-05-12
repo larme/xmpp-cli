@@ -9,12 +9,6 @@
 (defun config-pathname ()
   (merge-pathnames "config.yaml" (home-xmpp-cli-directory)))
 
-(defun config-temp-pathname ()
-  (merge-pathnames "config.yaml.tmp" (home-xmpp-cli-directory)))
-
-(defun proper-plist-p (plist)
-  (and (listp plist) (evenp (length plist))))
-
 (defun validate-profile-entry (entry)
   (unless (and (consp entry)
                (stringp (first entry))
@@ -34,13 +28,8 @@
     (mapc #'validate-profile-entry profiles)
     config))
 
-(defun keyword-to-yaml-key (keyword)
-  (substitute #\_ #\- (string-downcase (symbol-name keyword))))
-
-(defun yaml-key-to-keyword (key)
-  (intern (string-upcase (substitute #\- #\_ key)) :keyword))
-
-(defun profile-value-to-yaml (value)
+(defun profile-value-to-yaml (key value)
+  (declare (ignore key))
   (if (keywordp value)
       (string-downcase (symbol-name value))
       value))
@@ -54,13 +43,9 @@
     (t value)))
 
 (defun profile-to-yaml (entry)
-  (let ((plist (rest entry))
-        (mapping (list (cons "name" (first entry)))))
-    (loop for (key value) on plist by #'cddr
-          do (push (cons (keyword-to-yaml-key key)
-                         (profile-value-to-yaml value))
-                   mapping))
-    (nreverse mapping)))
+  (cons (cons "name" (first entry))
+        (plist-to-yaml (rest entry)
+                       :value-to-yaml #'profile-value-to-yaml)))
 
 (defun yaml-to-profile-entry (mapping)
   (unless (listp mapping)
@@ -69,10 +54,8 @@
     (unless (and (stringp name) (plusp (length name)))
       (error "Malformed config.yaml: profile name must be a non-empty string."))
     (cons name
-          (loop for (key . value) in mapping
-                unless (string= key "name")
-                  append (list (yaml-key-to-keyword key)
-                               (yaml-value-to-profile-value key value))))))
+          (yaml-to-plist (remove "name" mapping :key #'car :test #'string=)
+                         :value-from-yaml #'yaml-value-to-profile-value))))
 
 (defun config-to-yaml (config)
   (validate-config config)
@@ -102,11 +85,7 @@
 (defun save-config (config)
   (validate-config config)
   (ensure-private-directory)
-  (let ((temp (config-temp-pathname))
-        (target (config-pathname)))
-    (write-yaml-file temp (config-to-yaml config))
-    (uiop:rename-file-overwriting-target temp target)
-    target))
+  (write-yaml-atomically (config-pathname) (config-to-yaml config)))
 
 (defun default-profile-name (config)
   (or (getf config :default-profile) *default-profile-name*))

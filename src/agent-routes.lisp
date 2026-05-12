@@ -4,147 +4,20 @@
 (defparameter *routes-lock-stale-seconds* 30)
 (defparameter *routes-lock-wait-seconds* 10)
 
-(defun agent-directory ()
-  (merge-pathnames "agent/" (home-xmpp-cli-directory)))
-
 (defun routes-pathname ()
   (merge-pathnames "routes.yaml" (agent-directory)))
 
 (defun routes-lock-pathname ()
   (merge-pathnames "routes.lock" (agent-directory)))
 
-(defun routes-temp-pathname ()
-  (merge-pathnames
-   (format nil "routes.yaml.~36r.~36r.tmp"
-           (get-universal-time)
-           (random 1000000000))
-   (agent-directory)))
-
-(defun ensure-agent-directory ()
-  (ensure-private-directory (agent-directory)))
-
-(defun make-routes-lock-token ()
-  (format nil "~36r-~36r-~36r"
-          (get-universal-time)
-          (get-internal-real-time)
-          (random 1000000000)))
-
-(defun route-lock-to-yaml (token pid)
-  (let ((mapping (list (cons "token" token)
-                       (cons "created_at" (now-iso8601)))))
-    (when pid
-      (setf mapping (append mapping (list (cons "pid" pid)))))
-    mapping))
-
-(defun yaml-to-route-lock (yaml)
-  (unless (listp yaml)
-    (error "Malformed agent/routes.lock: expected a mapping."))
-  (let ((lock (list :token (yaml-value yaml "token" nil)
-                    :created-at (yaml-value yaml "created_at" nil)
-                    :pid (yaml-value yaml "pid" nil))))
-    (unless (and (stringp (getf lock :token))
-                 (plusp (length (getf lock :token))))
-      (error "Malformed agent/routes.lock: missing token."))
-    (when (and (getf lock :pid)
-               (not (integerp (getf lock :pid))))
-      (error "Malformed agent/routes.lock: pid must be an integer."))
-    lock))
-
-(defun read-legacy-route-lock ()
-  (handler-case
-      (let ((text (read-file-as-string (routes-lock-pathname))))
-        (let ((token (string-trim '(#\Newline #\Return #\Space #\Tab)
-                                  text)))
-          (and (plusp (length token))
-               (list :token token
-                     :pid nil
-                     :created-at nil))))
-    (error ()
-      nil)))
-
-(defun load-routes-lock ()
-  (let ((pathname (routes-lock-pathname)))
-    (and (probe-file pathname)
-         (or (handler-case
-                 (yaml-to-route-lock (read-yaml-file pathname))
-               (error ()
-                 nil))
-             (read-legacy-route-lock)))))
-
-(defun try-acquire-routes-lock (token)
-  (handler-case
-      (let ((stream (open (routes-lock-pathname)
-                          :direction :output
-                          :if-exists nil
-                          :if-does-not-exist :create
-                          :element-type 'character
-                          :external-format :utf-8)))
-        (when stream
-          (unwind-protect
-               (progn
-                 (write-string
-                  (emit-yaml
-                   (route-lock-to-yaml token (current-process-id)))
-                  stream)
-                 (finish-output stream)
-                 t)
-            (close stream))))
-    (file-error ()
-      nil)))
-
-(defun stale-routes-lock-p ()
-  (let* ((pathname (probe-file (routes-lock-pathname)))
-         (lock (and pathname (load-routes-lock)))
-         (pid (and lock (getf lock :pid)))
-         (write-date (and pathname (file-write-date pathname))))
-    (cond
-      (pid
-       (not (process-exists-p pid)))
-      (write-date
-       (> (- (get-universal-time) write-date)
-          *routes-lock-stale-seconds*))
-      (t
-       nil))))
-
-(defun routes-lock-owned-p (token)
-  (handler-case
-      (let ((lock (load-routes-lock)))
-        (and lock
-             (string= token
-                      (getf lock :token))))
-    (error ()
-      nil)))
-
-(defun release-routes-lock (token)
-  (when (and token (routes-lock-owned-p token))
-    (ignore-errors
-      (delete-file (routes-lock-pathname)))
-    t))
-
-(defun acquire-routes-lock (token &key
-                                    (timeout-seconds *routes-lock-wait-seconds*))
-  (ensure-agent-directory)
-  (let ((deadline (+ (get-internal-real-time)
-                     (round (* timeout-seconds
-                               internal-time-units-per-second)))))
-    (loop
-      (when (try-acquire-routes-lock token)
-        (return t))
-      (when (stale-routes-lock-p)
-        (ignore-errors
-          (delete-file (routes-lock-pathname))))
-      (when (>= (get-internal-real-time) deadline)
-        (error "Timed out waiting for agent route lock at ~a."
-               (namestring (routes-lock-pathname))))
-      (sleep 0.05))))
-
 (defun call-with-routes-lock (thunk)
-  (let ((token (make-routes-lock-token)))
-    (unwind-protect
-         (progn
-           (acquire-routes-lock token)
-           (funcall thunk))
-      (release-routes-lock token))))
+  (ensure-agent-directory)
+  (call-with-file-lock (routes-lock-pathname)
+                       thunk
+                       :timeout-seconds *routes-lock-wait-seconds*
+                       :stale-seconds *routes-lock-stale-seconds*
+                       :use-mtime-p t
+                       :label "agent route lock"))
 
 (defun canonical-route-identity (&key host
                                       tmux-socket
@@ -175,12 +48,6 @@
 (defun route-code-equal (left right)
   (and left right (string-equal left right)))
 
-(defun yaml-key-to-keyword (key)
-  (intern (string-upcase (substitute #\- #\_ key)) :keyword))
-
-(defun keyword-to-yaml-key (keyword)
-  (substitute #\_ #\- (string-downcase (symbol-name keyword))))
-
 (defun yaml-to-route-value (key value)
   (declare (ignore key))
   (if (yaml-null-p value) nil value))
@@ -192,14 +59,10 @@
 (defun yaml-to-route (mapping)
   (unless (listp mapping)
     (error "Malformed agent/routes.yaml: route entry must be a mapping."))
-  (loop for (key . value) in mapping
-        append (list (yaml-key-to-keyword key)
-                     (yaml-to-route-value key value))))
+  (yaml-to-plist mapping :value-from-yaml #'yaml-to-route-value))
 
 (defun route-to-yaml (route)
-  (loop for (key value) on route by #'cddr
-        collect (cons (keyword-to-yaml-key key)
-                      (route-value-to-yaml key value))))
+  (plist-to-yaml route :value-to-yaml #'route-value-to-yaml))
 
 (defun yaml-to-routes-file (yaml)
   (unless (listp yaml)
@@ -224,16 +87,7 @@
 
 (defun save-routes-to-disk (routes)
   (ensure-agent-directory)
-  (let ((temp (routes-temp-pathname))
-        (target (routes-pathname)))
-    (unwind-protect
-         (progn
-           (write-yaml-file temp (routes-file-to-yaml routes))
-           (uiop:rename-file-overwriting-target temp target))
-      (when (probe-file temp)
-        (ignore-errors
-          (delete-file temp))))
-    target))
+  (write-yaml-atomically (routes-pathname) (routes-file-to-yaml routes)))
 
 (defun load-routes ()
   (load-routes-from-disk))
