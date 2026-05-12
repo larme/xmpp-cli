@@ -95,6 +95,53 @@
         (check-equal "user@example.org" (getf loaded :notify-to))
         (check-equal nil (getf loaded :allowed-senders))))))
 
+(deftest daemon-lock-is-exclusive-and-token-owned
+  (with-isolated-data
+    (let ((first-token "aaaaaaaa")
+          (second-token "bbbbbbbb"))
+      (check (xmpp-cli/agent-ipc:acquire-daemon-lock first-token :pid 12345)
+             "first daemon should acquire the lock")
+      (check-equal 12345
+                   (getf (xmpp-cli/agent-ipc:load-daemon-lock) :pid))
+      (check (not (xmpp-cli/agent-ipc:acquire-daemon-lock second-token))
+             "second daemon should not acquire an existing lock")
+      (check (not (xmpp-cli/agent-ipc:release-daemon-lock second-token))
+             "non-owner should not release the daemon lock")
+      (check (probe-file (xmpp-cli/agent-ipc:daemon-lock-pathname))
+             "lock should still exist after non-owner release")
+      (check (not (xmpp-cli/agent-ipc:delete-stale-daemon-lock second-token))
+             "stale-lock cleanup should not delete another token")
+      (check (probe-file (xmpp-cli/agent-ipc:daemon-lock-pathname))
+             "lock should still exist after non-owner stale cleanup")
+      (check (xmpp-cli/agent-ipc:delete-stale-daemon-lock first-token)
+             "stale-lock cleanup should delete the observed token")
+      (check (not (probe-file (xmpp-cli/agent-ipc:daemon-lock-pathname)))
+             "lock should be removed after owner stale cleanup")
+      (check (xmpp-cli/agent-ipc:acquire-daemon-lock first-token)
+             "daemon should reacquire the lock after stale cleanup")
+      (check (xmpp-cli/agent-ipc:release-daemon-lock first-token)
+             "owner should release the daemon lock")
+      (check (not (probe-file (xmpp-cli/agent-ipc:daemon-lock-pathname)))
+             "lock should be removed after owner release"))))
+
+(deftest daemon-control-delete-is-token-safe
+  (with-isolated-data
+    (let ((control (list :pid 123
+                         :host "127.0.0.1"
+                         :port 4567
+                         :token "owner-token"
+                         :started-at "2026-05-12T00:00:00+08:00"
+                         :profile "default")))
+      (xmpp-cli/agent-ipc:save-control control)
+      (check (not (xmpp-cli/agent-ipc:delete-control "other-token"))
+             "non-owner should not delete control.yaml")
+      (check (probe-file (xmpp-cli/agent-ipc:control-pathname))
+             "control.yaml should remain after non-owner delete")
+      (check (xmpp-cli/agent-ipc:delete-control "owner-token")
+             "owner should delete control.yaml")
+      (check (not (probe-file (xmpp-cli/agent-ipc:control-pathname)))
+             "control.yaml should be removed by owner"))))
+
 (deftest json-parser-basic-object
   (let ((payload (xmpp-cli/json:parse-json
                   "{\"hook_event_name\":\"Stop\",\"turn_id\":\"t1\",\"tool_input\":{\"command\":\"ls\"},\"items\":[1,true,null]}")))

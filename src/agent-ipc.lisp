@@ -6,6 +6,9 @@
 (defun control-temp-pathname ()
   (merge-pathnames "control.yaml.tmp" (agent-directory)))
 
+(defun daemon-lock-pathname ()
+  (merge-pathnames "daemon.lock" (agent-directory)))
+
 (defun control-to-yaml (control)
   (list (cons "pid" (getf control :pid))
         (cons "host" (getf control :host))
@@ -32,10 +35,36 @@
       (error "Malformed agent/control.yaml: missing host, port, or token."))
     control))
 
+(defun lock-to-yaml (token pid)
+  (let ((mapping (list (cons "token" token)
+                       (cons "created_at" (now-iso8601)))))
+    (when pid
+      (setf mapping (append mapping (list (cons "pid" pid)))))
+    mapping))
+
+(defun yaml-to-lock (yaml)
+  (unless (listp yaml)
+    (error "Malformed agent/daemon.lock: expected a mapping."))
+  (let ((lock (list :token (yaml-value yaml "token" nil)
+                    :created-at (yaml-value yaml "created_at" nil)
+                    :pid (yaml-value yaml "pid" nil))))
+    (unless (and (stringp (getf lock :token))
+                 (plusp (length (getf lock :token))))
+      (error "Malformed agent/daemon.lock: missing token."))
+    (when (and (getf lock :pid)
+               (not (integerp (getf lock :pid))))
+      (error "Malformed agent/daemon.lock: pid must be an integer."))
+    lock))
+
 (defun load-control ()
   (let ((pathname (control-pathname)))
     (and (probe-file pathname)
          (yaml-to-control (read-yaml-file pathname)))))
+
+(defun load-daemon-lock ()
+  (let ((pathname (daemon-lock-pathname)))
+    (and (probe-file pathname)
+         (yaml-to-lock (read-yaml-file pathname)))))
 
 (defun save-control (control)
   (ensure-private-directory (agent-directory))
@@ -45,9 +74,62 @@
     (uiop:rename-file-overwriting-target temp target)
     target))
 
-(defun delete-control ()
-  (ignore-errors
-    (delete-file (control-pathname))))
+(defun acquire-daemon-lock (token &key pid)
+  (ensure-private-directory (agent-directory))
+  (handler-case
+      (let ((stream (open (daemon-lock-pathname)
+                          :direction :output
+                          :if-exists nil
+                          :if-does-not-exist :create
+                          :element-type 'character
+                          :external-format :utf-8)))
+        (when stream
+          (unwind-protect
+               (progn
+                 (write-string (emit-yaml (lock-to-yaml token pid)) stream)
+                 (finish-output stream)
+                 t)
+            (close stream))))
+    (file-error ()
+      nil)))
+
+(defun daemon-lock-owned-p (token)
+  (handler-case
+      (let ((lock (load-daemon-lock)))
+        (and lock
+             (string= token (getf lock :token))))
+    (error ()
+      nil)))
+
+(defun release-daemon-lock (token)
+  (when (and token (daemon-lock-owned-p token))
+    (ignore-errors
+      (delete-file (daemon-lock-pathname)))
+    t))
+
+(defun delete-stale-daemon-lock (&optional expected-token)
+  (when (or (null expected-token)
+            (handler-case
+                (let ((lock (load-daemon-lock)))
+                  (and lock
+                       (string= expected-token (getf lock :token))))
+              (error ()
+                nil)))
+    (ignore-errors
+      (delete-file (daemon-lock-pathname)))
+    t))
+
+(defun delete-control (&optional expected-token)
+  (when (or (null expected-token)
+            (handler-case
+                (let ((control (load-control)))
+                  (and control
+                       (string= expected-token (getf control :token))))
+              (error ()
+                nil)))
+    (ignore-errors
+      (delete-file (control-pathname)))
+    t))
 
 (defun make-control-token ()
   (string-downcase

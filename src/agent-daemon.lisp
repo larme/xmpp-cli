@@ -16,6 +16,7 @@
   (lock (bt:make-lock "xmpp-cli agent daemon")))
 
 (defparameter *reply-whitespace* '(#\Space #\Tab #\Newline #\Return))
+(defparameter *daemon-thread-stop-wait-seconds* 5)
 
 (defun current-process-id ()
   #+sbcl
@@ -275,12 +276,93 @@
                  (unless (state-stopped-p state)
                    (format *error-output*
                            "~&xmpp-cli daemon: control accept failed: ~a~%"
-                           condition)))))))
+                           condition)
+                   (finish-output *error-output*)
+                   (error condition)))))))
 
 (defun running-daemon-p ()
   (multiple-value-bind (ok response error) (daemon-status)
     (declare (ignore response error))
     ok))
+
+#+linux
+(defun linux-process-state (pid)
+  (handler-case
+      (with-open-file (in (format nil "/proc/~d/stat" pid)
+                          :direction :input
+                          :element-type 'character)
+        (let* ((line (read-line in nil ""))
+               (close (position #\) line :from-end t))
+               (state-index (and close (+ close 2))))
+          (and state-index
+               (< state-index (length line))
+               (char line state-index))))
+    (error ()
+      nil)))
+
+(defun process-exists-p (pid)
+  (and (integerp pid)
+       (plusp pid)
+       #+linux
+       (let ((state (linux-process-state pid)))
+         (and state
+              (not (char= state #\Z))))
+       #-linux
+       t))
+
+(defun lock-control-pid (lock)
+  (handler-case
+      (let ((control (load-control)))
+        (and control
+             lock
+             (string= (getf lock :token) (getf control :token))
+             (getf control :pid)))
+    (error ()
+      nil)))
+
+(defun lock-owner-pid (lock)
+  (or (getf lock :pid)
+      (lock-control-pid lock)))
+
+(defun stale-daemon-lock-p (lock)
+  (let ((pid (lock-owner-pid lock)))
+    (and pid
+         (not (process-exists-p pid)))))
+
+(defun fail-daemon-lock-held (lock)
+  (let ((pid (and lock (lock-owner-pid lock))))
+    (if pid
+        (error "xmpp-cli agent daemon lock is held at ~a by pid ~d. If no daemon is running, remove that file."
+               (namestring (daemon-lock-pathname))
+               pid)
+        (error "xmpp-cli agent daemon lock is held at ~a. If no daemon is running, remove that file."
+               (namestring (daemon-lock-pathname))))))
+
+(defun remove-stale-daemon-lock (lock)
+  (let ((token (getf lock :token)))
+    (delete-control token)
+    (delete-stale-daemon-lock token)))
+
+(defun acquire-daemon-lock-or-error (token)
+  (let ((pid (current-process-id)))
+    (unless (acquire-daemon-lock token :pid pid)
+      (let ((lock (handler-case
+                      (load-daemon-lock)
+                    (error ()
+                      nil))))
+        (cond
+          ((and lock (stale-daemon-lock-p lock))
+           (format *error-output*
+                   "~&xmpp-cli agent daemon: removing stale lock at ~a for dead pid ~d.~%"
+                   (namestring (daemon-lock-pathname))
+                   (lock-owner-pid lock))
+           (finish-output *error-output*)
+           (remove-stale-daemon-lock lock)
+           (unless (acquire-daemon-lock token :pid pid)
+             (fail-daemon-lock-held (ignore-errors (load-daemon-lock)))))
+          (t
+           (fail-daemon-lock-held lock))))))
+  t)
 
 (defun make-control (server profile-name token)
   (list :pid (current-process-id)
@@ -290,32 +372,63 @@
         :started-at (now-iso8601)
         :profile profile-name))
 
+(defun wait-for-thread-stop (thread seconds)
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* seconds internal-time-units-per-second)))))
+    (loop while (and (bt:thread-alive-p thread)
+                     (< (get-internal-real-time) deadline))
+          do (sleep 0.1))
+    (not (bt:thread-alive-p thread))))
+
+(defun cleanup-daemon (state server xmpp-thread token lock-acquired)
+  (when state
+    (ignore-errors
+      (request-stop state)))
+  (when server
+    (ignore-errors
+      (usocket:socket-close server)))
+  (when (and xmpp-thread (bt:thread-alive-p xmpp-thread))
+    (unless (wait-for-thread-stop xmpp-thread *daemon-thread-stop-wait-seconds*)
+      (format *error-output*
+              "~&xmpp-cli daemon: XMPP thread did not stop cleanly; destroying it.~%")
+      (finish-output *error-output*)
+      (ignore-errors
+        (bt:destroy-thread xmpp-thread))))
+  (delete-control token)
+  (when lock-acquired
+    (release-daemon-lock token)))
+
 (defun run-daemon (backend)
-  (when (running-daemon-p)
-    (error "xmpp-cli agent daemon is already running."))
   (let* ((agent-config (load-agent-config))
          (profile-name (getf agent-config :profile "default"))
          (state-config (load-config))
-         (profile-plist (profile state-config profile-name)))
+         (profile-plist (profile state-config profile-name))
+         (token (make-control-token))
+         (lock-acquired nil)
+         (server nil)
+         (state nil)
+         (xmpp-thread nil))
     (unless profile-plist
       (error "No auth/profile data found for profile ~a. Run xmpp-cli login first."
              profile-name))
-    (let* ((server (usocket:socket-listen "127.0.0.1"
-                                          0
-                                          :reuse-address t
-                                          :element-type '(unsigned-byte 8)))
-           (token (make-control-token))
-           (control (make-control server profile-name token))
-           (state (make-daemon-state :backend backend
-                                     :profile-name profile-name
-                                     :profile profile-plist
-                                     :agent-config agent-config
-                                     :control control
-                                     :server-socket server
-                                     :token token))
-           (xmpp-thread nil))
-      (unwind-protect
-           (progn
+    (unwind-protect
+         (progn
+           (acquire-daemon-lock-or-error token)
+           (setf lock-acquired t)
+           (when (running-daemon-p)
+             (error "xmpp-cli agent daemon is already running."))
+           (setf server (usocket:socket-listen "127.0.0.1"
+                                               0
+                                               :reuse-address t
+                                               :element-type '(unsigned-byte 8)))
+           (let ((control (make-control server profile-name token)))
+             (setf state (make-daemon-state :backend backend
+                                            :profile-name profile-name
+                                            :profile profile-plist
+                                            :agent-config agent-config
+                                            :control control
+                                            :server-socket server
+                                            :token token))
              (save-control control)
              (setf xmpp-thread
                    (bt:make-thread (lambda () (xmpp-loop state))
@@ -325,11 +438,5 @@
                      profile-name)
              (finish-output)
              (accept-control-loop state)
-             0)
-        (request-stop state)
-        (ignore-errors
-          (usocket:socket-close server))
-        (when (and xmpp-thread (bt:thread-alive-p xmpp-thread))
-          (ignore-errors
-            (bt:destroy-thread xmpp-thread)))
-        (delete-control)))))
+             0))
+      (cleanup-daemon state server xmpp-thread token lock-acquired))))

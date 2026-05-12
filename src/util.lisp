@@ -3,8 +3,15 @@
 (defvar *data-directory* nil
   "Internal test hook. When non-NIL, use this directory for xmpp-cli state.")
 
+(defun environment-data-directory ()
+  (let ((value (uiop:getenv "XMPP_CLI_DATA_DIR")))
+    (and value
+         (plusp (length value))
+         (uiop:ensure-directory-pathname value))))
+
 (defun home-xmpp-cli-directory ()
   (or *data-directory*
+      (environment-data-directory)
       (merge-pathnames #P".local/xmpp-cli/" (user-homedir-pathname))))
 
 (defun chmod-best-effort (pathname mode)

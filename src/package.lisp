@@ -176,6 +176,7 @@
                 #:ensure-private-directory
                 #:now-iso8601)
   (:import-from #:xmpp-cli/yaml
+                #:emit-yaml
                 #:read-yaml-file
                 #:write-yaml-file
                 #:yaml-value)
@@ -183,9 +184,14 @@
                 #:agent-directory)
   (:export
    #:control-pathname
+   #:daemon-lock-pathname
    #:load-control
+   #:load-daemon-lock
    #:save-control
    #:delete-control
+   #:acquire-daemon-lock
+   #:release-daemon-lock
+   #:delete-stale-daemon-lock
    #:make-control-token
    #:read-ipc-message
    #:write-ipc-message
@@ -219,8 +225,13 @@
                 #:close-connection)
   (:import-from #:xmpp-cli/agent-ipc
                 #:load-control
+                #:load-daemon-lock
+                #:daemon-lock-pathname
                 #:save-control
                 #:delete-control
+                #:acquire-daemon-lock
+                #:release-daemon-lock
+                #:delete-stale-daemon-lock
                 #:make-control-token
                 #:read-ipc-message
                 #:write-ipc-message

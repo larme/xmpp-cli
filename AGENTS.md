@@ -68,13 +68,15 @@ Before calling a LispWorks-sensitive change done:
    ```
 
 4. For hook parsing, test Unicode without touching the real account by using a
-   temporary `HOME`:
+   temporary `XMPP_CLI_DATA_DIR`. Do not rely on `HOME` for delivered
+   LispWorks images; `user-homedir-pathname` may still resolve to the real
+   account home.
 
    ```sh
-   tmp_home=$(mktemp -d)
+   tmp_data=$(mktemp -d)
    printf '%s' '{"hook_event_name":"Stop","model":"smoke","turn_id":"unicode","cwd":"/tmp","last_assistant_message":"I\u2019m fine"}' \
-     | HOME="$tmp_home" ./build/xmpp-cli agent notify-codex
-   rm -rf "$tmp_home"
+     | XMPP_CLI_DATA_DIR="$tmp_data" ./build/xmpp-cli agent notify-codex
+   rm -rf "$tmp_data"
    ```
 
 5. If the daemon is running, restart it after rebuilding:
@@ -85,4 +87,3 @@ Before calling a LispWorks-sensitive change done:
      >> "$HOME/.local/xmpp-cli/agent/daemon.log" 2>&1
    ./build/xmpp-cli agent status
    ```
-
