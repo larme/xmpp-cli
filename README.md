@@ -197,7 +197,9 @@ Room commands use XEP-0045 MUC rooms for route-specific feedback:
 `/room` always requires an explicit route code. It creates a temporary private
 room, binds it to that route, invites the command sender, and replies with the
 room JID plus `xmpp:...?...join` URI. Messages sent inside the room are routed
-to the bound tmux pane without changing the direct-chat default route.
+to the bound tmux pane without changing the direct-chat default route. Inside a
+room, room-local commands omit the `room-` prefix, so `/room-close ...` in a
+direct chat becomes `/close` in the room itself.
 
 ## Tests
 

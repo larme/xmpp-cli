@@ -173,6 +173,10 @@
                            length)))
             finally (return (nreverse parts))))))
 
+(defun string-prefix-p (prefix string)
+  (and (<= (length prefix) (length string))
+       (string= prefix string :end2 (length prefix))))
+
 (defun resolve-command-route (state route-code)
   (let* ((routes (active-routes-for-state state))
          (ttl-days (route-ttl-days state)))
@@ -589,6 +593,70 @@ into a room that only the bot has joined after reconnect."
    (getf room :room-jid)
    (format nil "xmpp-cli: sent feedback to ~a" (getf route :code))))
 
+(defun room-close-result-message (room destroyed destroy-error)
+  (if destroyed
+      (format nil "xmpp-cli: closed room ~a"
+              (getf room :room-jid))
+      (format nil
+              "xmpp-cli: closed room ~a locally; server destroy was not acknowledged: ~a"
+              (getf room :room-jid)
+              destroy-error)))
+
+(defun handle-room-local-close-command (state room arguments)
+  (let ((room-jid (getf room :room-jid)))
+    (cond
+      (arguments
+       (send-room-note state room-jid "xmpp-cli: usage: /close"))
+      (t
+       (send-room-note state room-jid
+                       (format nil "xmpp-cli: closing room ~a" room-jid))
+       (handler-case
+           (multiple-value-bind (destroyed destroy-error)
+               (close-room state
+                           room
+                           :reason "closed by xmpp-cli room user")
+             (declare (ignore destroyed))
+             (when destroy-error
+               (format *error-output*
+                       "~&xmpp-cli daemon: closed room ~a locally; server destroy was not acknowledged: ~a~%"
+                       room-jid
+                       destroy-error)
+               (finish-output *error-output*)))
+         (error (condition)
+           (send-room-note
+            state
+            room-jid
+            (format nil "xmpp-cli: /close failed for ~a: ~a"
+                    room-jid
+                    condition)))))))
+  t)
+
+(defun handle-room-local-command (state room body)
+  (multiple-value-bind (name rest)
+      (parse-agent-command body)
+    (when name
+      (let ((room-jid (getf room :room-jid)))
+        (cond
+          ((string= name "close")
+           (handle-room-local-close-command
+            state
+            room
+            (split-command-arguments rest)))
+          ((string-prefix-p "room-" name)
+           (send-room-note
+            state
+            room-jid
+            (format nil
+                    "xmpp-cli: room commands inside a room omit the room- prefix; use /~a"
+                    (subseq name (length "room-"))))
+           t)
+          (t
+           (send-room-note
+            state
+            room-jid
+            (format nil "xmpp-cli: unknown room command /~a" name))
+           t))))))
+
 (defun handle-room-message (state stanza)
   (let* ((body (reply-text (getf stanza :body)))
          (room-jid (getf stanza :room-jid)))
@@ -607,6 +675,8 @@ into a room that only the bot has joined after reconnect."
                  state
                  (getf room :room-jid)
                  "xmpp-cli: ignored message because the room sender could not be verified as an allowed JID."))
+               ((handle-room-local-command state room body)
+                t)
                (t
                 (let ((route (route-for-room state room)))
                   (cond
@@ -780,13 +850,7 @@ into a room that only the bot has joined after reconnect."
                 (send-daemon-note
                  state
                  from
-                 (if destroyed
-                     (format nil "xmpp-cli: closed room ~a"
-                             (getf room :room-jid))
-                     (format nil
-                             "xmpp-cli: closed room ~a locally; server destroy was not acknowledged: ~a"
-                             (getf room :room-jid)
-                             destroy-error))))
+                 (room-close-result-message room destroyed destroy-error)))
             (error (condition)
               (send-daemon-note
                state
@@ -795,7 +859,7 @@ into a room that only the bot has joined after reconnect."
                        (getf room :room-jid)
                        condition))))))))))
 
-(defun handle-agent-command (state from body)
+(defun handle-direct-command (state from body)
   (multiple-value-bind (name rest)
       (parse-agent-command body)
     (cond
@@ -838,5 +902,5 @@ into a room that only the bot has joined after reconnect."
         (t
          (let ((text (reply-text body)))
            (if (command-text-p text)
-               (handle-agent-command state from text)
+               (handle-direct-command state from text)
                (handle-route-reply state from text))))))))

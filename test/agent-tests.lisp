@@ -651,6 +651,100 @@
                        *fake-events*)
                  "close should leave the MUC even if destroy is not acknowledged"))))))
 
+(deftest room-local-close-command-closes-current-room
+  (with-isolated-data
+    (let* ((room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil)
+            (*room-test-state* state)
+            (*fake-destroy-room-replies-p* t))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "room@groups.example.org/friend"
+               :room-jid "room@groups.example.org"
+               :room-nick "friend"
+               :body "/close"))
+        (check-equal "closed"
+                     (getf (first (xmpp-cli/agent-rooms:load-rooms))
+                           :state))
+        (check (some (lambda (event)
+                       (eq (first event) :send-room-message))
+                     *fake-events*)
+               "room /close should acknowledge in the room before closing")
+        (check (some (lambda (event)
+                       (eq (first event) :destroy-room))
+                     *fake-events*)
+               "room /close should try to destroy the current room")
+        (check (some (lambda (event)
+                       (eq (first event) :leave-room))
+                     *fake-events*)
+               "room /close should leave the current room")))))
+
+(deftest room-prefixed-direct-command-is-not-routed-inside-room
+  (with-isolated-data
+    (let* ((room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "room@groups.example.org/friend"
+               :room-jid "room@groups.example.org"
+               :room-nick "friend"
+               :body "/room-close"))
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-room-message)
+                            (search "use /close" (third event))))
+                     *fake-events*)
+               "room-local commands should suggest the unprefixed form")
+        (check (not (some (lambda (event)
+                            (eq (first event) :destroy-room))
+                          *fake-events*))
+               "prefixed direct command should not close a room from inside the room")))))
+
 (deftest room-state-keeps-one-active-room-per-route
   (with-isolated-data
     (let ((old-room (list :room-jid "old@groups.example.org"
