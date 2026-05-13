@@ -10,19 +10,21 @@ CONFIG="$CODEX_HOME/config.toml"
 XMPP_CLI="${XMPP_CLI:-$(command -v xmpp-cli || true)}"
 
 PYTHON_BIN="$(command -v python3 || true)"
-if [ "$#" -gt 1 ] || [ -z "$TARGET" ]; then
-  printf 'Usage: %s user@example.org\n' "$0" >&2
+if [ "$#" -gt 1 ]; then
+  printf 'Usage: %s [user@example.org]\n' "$0" >&2
   printf '   or: CODEX_XMPP_NOTIFY_TO=user@example.org %s\n' "$0" >&2
   exit 2
 fi
 
-case "$TARGET" in
-  *'
+if [ -n "$TARGET" ]; then
+  case "$TARGET" in
+    *'
 '*)
-    printf 'XMPP notification recipient must be a single line\n' >&2
-    exit 2
-    ;;
-esac
+      printf 'XMPP notification recipient must be a single line\n' >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if [ -z "$PYTHON_BIN" ]; then
   printf 'python3 is required to update the Codex config\n' >&2
@@ -34,7 +36,9 @@ if [ -z "$XMPP_CLI" ]; then
   exit 1
 fi
 
-"$XMPP_CLI" agent config set-notify-to "$TARGET" >/dev/null
+if [ -n "$TARGET" ]; then
+  "$XMPP_CLI" agent config set-notify-to "$TARGET" >/dev/null
+fi
 
 mkdir -p "$CODEX_HOME"
 touch "$CONFIG"
@@ -137,5 +141,9 @@ if command -v codex >/dev/null 2>&1; then
   codex debug prompt-input "codex xmpp hook config check" >/dev/null
 fi
 
-printf 'Configured XMPP notification target in ~/.local/xmpp-cli/agent/config.yaml\n'
+if [ -n "$TARGET" ]; then
+  printf 'Configured XMPP notification target in ~/.local/xmpp-cli/agent/config.yaml\n'
+else
+  printf 'Left XMPP notification target unchanged; configure it with xmpp-cli agent config set-notify-to <jid>\n'
+fi
 printf 'Updated Codex config at %s\n' "$CONFIG"

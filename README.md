@@ -154,19 +154,27 @@ This repository includes an installable Codex hook that sends XMPP
 notifications when Codex finishes a turn or needs human approval. It assumes
 `xmpp-cli` is installed in `PATH` and already has a usable default profile.
 
+Configure the notification recipient once:
+
 ```sh
-./scripts/install-codex-xmpp-hook.sh you@example.org
+xmpp-cli agent config set-notify-to you@example.org
 ```
 
-You can also supply the recipient through the environment:
+Then install or update the Codex hook:
 
 ```sh
+./scripts/install-codex-xmpp-hook.sh
+```
+
+For convenience, the installer can still set the recipient while installing:
+
+```sh
+./scripts/install-codex-xmpp-hook.sh you@example.org
 CODEX_XMPP_NOTIFY_TO=you@example.org ./scripts/install-codex-xmpp-hook.sh
 ```
 
-The installer stores the recipient in
-`~/.local/xmpp-cli/agent/config.yaml`, enables Codex hooks, and registers
-`Stop` plus `PermissionRequest` hooks in `config.toml` using:
+The installer enables Codex hooks and registers `Stop` plus
+`PermissionRequest` hooks in `config.toml` using:
 
 ```sh
 xmpp-cli agent notify-codex
