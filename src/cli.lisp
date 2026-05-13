@@ -237,7 +237,7 @@
         (notify-codex-warning
          "no XMPP notification target configured; run xmpp-cli agent config set-notify-to <jid>")))
     (let* ((state-config (load-config))
-           (profile-name (getf agent-config :profile "default"))
+           (profile-name (getf agent-config :profile))
            (profile-plist (profile state-config profile-name)))
       (unless profile-plist
         (return-from handle-agent-notify-codex
@@ -257,17 +257,17 @@
              (bodies (notification-bodies notification))
              (send-error nil))
         (multiple-value-bind (transport error)
-            (send-message-parts-with-fallback profile-name
-                                              profile-plist
-                                              target
-                                              bodies)
+            (send-notification-parts-with-fallback profile-name
+                                                   profile-plist
+                                                   target
+                                                   bodies)
           (declare (ignore transport))
           (setf send-error error))
         (if send-error
             (progn
               (ignore-errors
                 (append-send-history profile-name
-                                     target
+                                     (delivery-target-label target)
                                      :codex-notification
                                      body
                                      :failed
@@ -277,7 +277,7 @@
                send-error))
             (progn
               (maybe-append-send-history profile-name
-                                         target
+                                         (delivery-target-label target)
                                          :codex-notification
                                          body
                                          :sent)
@@ -318,14 +318,31 @@
   (multiple-value-bind (ok response error) (daemon-stop)
     (declare (ignore response))
     (if ok
-        (progn
-          (format t "daemon: stop requested~%")
-          +exit-success+)
+        (if (wait-for-daemon-stop)
+            (progn
+              (format t "daemon: stopped~%")
+              +exit-success+)
+            (progn
+              (format *error-output*
+                      "daemon: stop requested, but cleanup did not finish~%")
+              +exit-general+))
         (progn
           (if (and error (not (eq error :no-control)))
               (format *error-output* "daemon: not stopped (~a)~%" error)
               (format *error-output* "daemon: not stopped~%"))
           +exit-general+))))
+
+(defun handle-agent-discover-muc (cmd)
+  (multiple-value-bind (ok response error)
+      (daemon-discover-muc :force (option cmd :force))
+    (cond
+      (ok
+       (format t "~a" (muc-service-result-summary response))
+       +exit-success+)
+      (t
+       (fail +exit-general+
+             "discover-muc failed: ~a"
+             (or error "daemon is not running; start xmpp-cli agent daemon first"))))))
 
 (defun handle-agent-focus (cmd)
   (let ((args (clingon:command-arguments cmd)))
@@ -435,6 +452,20 @@
    :description "stop the running XMPP agent bridge daemon"
    :handler #'handle-agent-stop))
 
+(defun agent-discover-muc-options ()
+  (list
+   (clingon:make-option :flag
+                        :long-name "force"
+                        :description "Ignore cached MUC service discovery"
+                        :key :force)))
+
+(defun agent-discover-muc-command ()
+  (clingon:make-command
+   :name "discover-muc"
+   :description "discover the account's XMPP multi-user chat service"
+   :options (agent-discover-muc-options)
+   :handler #'handle-agent-discover-muc))
+
 (defun agent-notify-codex-command ()
   (clingon:make-command
    :name "notify-codex"
@@ -461,6 +492,7 @@
                        (agent-daemon-command)
                        (agent-status-command)
                        (agent-stop-command)
+                       (agent-discover-muc-command)
                        (agent-notify-codex-command)
                        (agent-focus-command))))
 

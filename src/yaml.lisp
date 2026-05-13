@@ -1,6 +1,7 @@
 (in-package #:xmpp-cli/yaml)
 
 (defconstant +yaml-null+ :yaml-null)
+(defconstant +yaml-false+ :yaml-false)
 
 (defstruct yaml-line
   indent
@@ -11,6 +12,12 @@
 
 (defun yaml-null-p (value)
   (eq value +yaml-null+))
+
+(defun yaml-false ()
+  +yaml-false+)
+
+(defun yaml-false-p (value)
+  (eq value +yaml-false+))
 
 (defun whitespace-char-p (char)
   (member char '(#\Space #\Tab #\Newline #\Return) :test #'char=))
@@ -305,6 +312,7 @@
 (defun emit-scalar (value)
   (cond
     ((yaml-null-p value) "null")
+    ((yaml-false-p value) "false")
     ((stringp value) (escape-yaml-string value))
     ((integerp value) (princ-to-string value))
     ((eq value t) "true")

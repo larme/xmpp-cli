@@ -34,6 +34,8 @@
      (:file "tmux")
      (:file "agent-codex")
      (:file "xmpp-backend")
+     (:file "agent-muc")
+     (:file "agent-rooms")
      (:file "agent-ipc")
      (:file "agent-daemon-state")
      (:file "agent-replies")

@@ -90,6 +90,13 @@ Check and stop it with:
 ./build/xmpp-cli agent stop
 ```
 
+Discover the server's MUC service when you want chat rooms:
+
+```sh
+./build/xmpp-cli agent discover-muc
+./build/xmpp-cli agent discover-muc --force
+```
+
 Codex notifications include a four-letter lowercase route code. Reply with
 only the code to focus that tmux pane:
 
@@ -121,6 +128,8 @@ agent/config.yaml
 agent/routes.yaml
 agent/control.yaml
 agent/tmp/
+agent/muc-services.yaml
+agent/rooms.yaml
 logs/
 ```
 
@@ -176,6 +185,19 @@ starts a fresh Codex session in a new tmux window, using the same working
 directory and tmux session as the selected route. When `route-code` is omitted,
 the most recently active route is used. The daemon reply includes the new route
 code for the fresh window.
+
+Room commands use XEP-0045 MUC rooms for route-specific feedback:
+
+```text
+/room <route-code> [room-name]
+/rooms
+/room-close <room-jid-or-route-code>
+```
+
+`/room` always requires an explicit route code. It creates a temporary private
+room, binds it to that route, invites the command sender, and replies with the
+room JID plus `xmpp:...?...join` URI. Messages sent inside the room are routed
+to the bound tmux pane without changing the direct-chat default route.
 
 ## Tests
 

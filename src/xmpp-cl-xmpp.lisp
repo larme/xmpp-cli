@@ -348,19 +348,342 @@
   (xmpp:message connection to body :type :chat)
   :sent)
 
+(defun xml-attribute-value (element name)
+  (let ((attribute (and element
+                        (xmpp:get-attribute element name))))
+    (and attribute
+         (xmpp:value attribute))))
+
+(defun xml-child-text (element name)
+  (let* ((child (and element
+                     (xmpp:get-element element name)))
+         (text (and child
+                    (xmpp:get-element child :\#text))))
+    (and text
+         (xmpp:data text))))
+
+(defun xml-namespace (element)
+  (xml-attribute-value element :xmlns))
+
+(defun xml-query-namespace (element)
+  (xml-namespace (and element
+                      (xmpp:get-element element :query))))
+
+(defun event-xml-element (event)
+  (and (typep event 'xmpp:event)
+       (xmpp:xml-element event)))
+
+(defun xml-attribute-value-any (element names)
+  (loop for name in names
+        for value = (xml-attribute-value element name)
+        when value
+          return value))
+
+(defun xml-query (element)
+  (and element
+       (xmpp:get-element element :query)))
+
+(defun xml-elements (element name)
+  (and element
+       (xmpp::get-elements element name)))
+
+(defun disco-identity-plists (query)
+  (loop for identity in (xml-elements query :identity)
+        collect (list :category (xml-attribute-value identity :category)
+                      :type (xml-attribute-value-any identity
+                                                     '(:type :type-))
+                      :name (xml-attribute-value identity :name))))
+
+(defun disco-feature-vars (query)
+  (loop for feature in (xml-elements query :feature)
+        for var = (xml-attribute-value feature :var)
+        when var
+          collect var))
+
+(defun disco-item-plists (query)
+  (loop for item in (xml-elements query :item)
+        collect (list :jid (xml-attribute-value item :jid)
+                      :name (xml-attribute-value item :name)
+                      :node (xml-attribute-value item :node))))
+
+(defun data-form-fields (x)
+  (loop for field in (xml-elements x :field)
+        collect (list :var (xml-attribute-value field :var)
+                      :type (xml-attribute-value-any field '(:type :type-))
+                      :values (loop for value in (xml-elements field :value)
+                                    for text = (and value
+                                                    (xmpp:get-element value :\#text))
+                                    collect (or (and text (xmpp:data text))
+                                                "")))))
+
+(defun query-data-form-fields (query)
+  (let ((x (find-if (lambda (candidate)
+                      (string= (or (xml-namespace candidate) "")
+                               "jabber:x:data"))
+                    (xml-elements query :x))))
+    (and x (data-form-fields x))))
+
+(defun muc-user-element (element)
+  (find-if (lambda (candidate)
+             (string= (or (xml-namespace candidate) "")
+                      "http://jabber.org/protocol/muc#user"))
+           (xml-elements element :x)))
+
+(defun muc-user-fields (element)
+  (let* ((x (muc-user-element element))
+         (item (and x (xmpp:get-element x :item))))
+    (when x
+      (list :muc-user-p t
+            :muc-jid (and item (xml-attribute-value item :jid))
+            :muc-affiliation (and item
+                                  (xml-attribute-value item :affiliation))
+            :muc-role (and item (xml-attribute-value item :role))
+            :muc-status-codes
+            (loop for status in (xml-elements x :status)
+                  for code = (xml-attribute-value status :code)
+                  when code collect code)))))
+
+(defun append-room-address-fields (stanza)
+  (let ((from (getf stanza :from)))
+    (if (and from (position #\/ from))
+        (multiple-value-bind (room nick)
+            (parse-room-occupant-jid from)
+          (append stanza (list :room-jid room :room-nick nick)))
+        stanza)))
+
+(defun append-disco-fields (stanza element)
+  (let* ((query (xml-query element))
+         (xmlns (xml-namespace query)))
+    (cond
+      ((string= (or xmlns "") "http://jabber.org/protocol/disco#info")
+       (append stanza
+               (list :disco-identities (disco-identity-plists query)
+                     :disco-features (disco-feature-vars query))))
+      ((string= (or xmlns "") "http://jabber.org/protocol/disco#items")
+       (append stanza
+               (list :disco-items (disco-item-plists query))))
+      ((string= (or xmlns "") "http://jabber.org/protocol/muc#owner")
+       (append stanza
+               (list :data-form-fields (query-data-form-fields query))))
+      (t
+       stanza))))
+
+(defun stanza-kind (element)
+  (case (xmpp:name element)
+    (:message
+     (if (string-equal (or (xml-attribute-value element :type) "")
+                       "groupchat")
+         :groupchat
+         :message))
+    (:presence :presence)
+    (:iq :iq)
+    (t :stanza)))
+
+(defun xml-element-stanza-plist (element)
+  (let ((kind (stanza-kind element)))
+    (append-room-address-fields
+     (append-disco-fields
+      (append
+       (list :kind kind
+             :name (xmpp:name element)
+             :from (xml-attribute-value element :from)
+             :to (xml-attribute-value element :to)
+             :id (xml-attribute-value element :id)
+             :type (xml-attribute-value element :type)
+             :body (and (member kind '(:message :groupchat))
+                        (xml-child-text element :body))
+             :query-xmlns (and (eq kind :iq)
+                               (xml-query-namespace element))
+             :raw element)
+       (and (eq kind :presence)
+            (muc-user-fields element)))
+      element))))
+
+(defun event-stanza-plist (event)
+  (cond
+    ((typep event 'xmpp:xml-element)
+     (xml-element-stanza-plist event))
+    ((typep event 'xmpp:message)
+     (let ((kind (if (string-equal (or (xmpp:type- event) "")
+                                    "groupchat")
+                     :groupchat
+                     :message)))
+       (append-room-address-fields
+        (list :kind kind
+              :from (xmpp:from event)
+              :to (xmpp:to event)
+              :id (xmpp:id event)
+              :type (xmpp:type- event)
+              :body (xmpp:body event)
+              :raw event))))
+    ((typep event 'xmpp:presence)
+     (let ((element (event-xml-element event)))
+       (append-room-address-fields
+        (append
+         (list :kind :presence
+               :from (xmpp:from event)
+               :to (xmpp:to event)
+               :type (xmpp:type- event)
+               :raw event)
+         (and element (muc-user-fields element))))))
+    ((typep event 'xmpp:simple-result)
+     (list :kind :iq
+           :from (xmpp:from event)
+           :to (xmpp:to event)
+           :id (xmpp:id event)
+           :type (xmpp:type- event)
+           :raw event))
+    (t
+     (list :kind :stanza
+           :raw event))))
+
+(defmethod receive-connected-stanza ((backend cl-xmpp-backend) connection)
+  (declare (ignore backend))
+  (event-stanza-plist (xmpp:receive-stanza connection :dom-repr t)))
+
 (defmethod receive-connected-message-loop ((backend cl-xmpp-backend)
                                            connection
                                            handler)
+  (loop for stanza = (receive-connected-stanza backend connection)
+        do (funcall handler stanza)))
+
+(defmethod send-disco-info ((backend cl-xmpp-backend) connection to id
+                            &key node)
   (declare (ignore backend))
-  (loop for event = (xmpp:receive-stanza connection)
-        do (when (typep event 'xmpp:message)
-             (let ((body (xmpp:body event)))
-               (when (and body (plusp (length body)))
-                 (funcall handler
-                          (list :from (xmpp:from event)
-                                :to (xmpp:to event)
-                                :type (xmpp:type- event)
-                                :body body)))))))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :xmlns "http://jabber.org/protocol/disco#info"
+                       :to to
+                       :node node)))
+
+(defmethod send-disco-items ((backend cl-xmpp-backend) connection to id
+                             &key node)
+  (declare (ignore backend))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :xmlns "http://jabber.org/protocol/disco#items"
+                       :to to
+                       :node node)))
+
+(defmethod join-room ((backend cl-xmpp-backend) connection room-full-jid)
+  (declare (ignore backend))
+  (xmpp::with-xml-output (connection)
+    (fxml:with-element "presence"
+      (fxml:attribute "to" room-full-jid)
+      (fxml:with-element "x"
+        (fxml:attribute "xmlns" "http://jabber.org/protocol/muc")
+        (fxml:with-element "history"
+          (fxml:attribute "maxchars" "0"))))))
+
+(defmethod request-room-config ((backend cl-xmpp-backend)
+                                connection
+                                room-jid
+                                id)
+  (declare (ignore backend))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :type "get"
+                       :to room-jid
+                       :xmlns "http://jabber.org/protocol/muc#owner")))
+
+(defun form-value-list (value)
+  (cond
+    ((null value) (list ""))
+    ((listp value) value)
+    (t (list value))))
+
+(defun write-data-form-field (var value &optional type)
+  (fxml:with-element "field"
+    (when type
+      (fxml:attribute "type" type))
+    (when var
+      (fxml:attribute "var" var))
+    (dolist (item (form-value-list value))
+      (fxml:with-element "value"
+        (fxml:text (or item ""))))))
+
+(defmethod submit-room-config ((backend cl-xmpp-backend)
+                               connection
+                               room-jid
+                               id
+                               fields)
+  (declare (ignore backend))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :type "set"
+                       :to room-jid
+                       :xmlns "http://jabber.org/protocol/muc#owner")
+    (fxml:with-element "x"
+      (fxml:attribute "xmlns" "jabber:x:data")
+      (fxml:attribute "type" "submit")
+      (dolist (field fields)
+        (destructuring-bind (var value &optional type) field
+          (write-data-form-field var value type))))))
+
+(defmethod grant-room-membership ((backend cl-xmpp-backend)
+                                  connection
+                                  room-jid
+                                  id
+                                  jid)
+  (declare (ignore backend))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :type "set"
+                       :to room-jid
+                       :xmlns "http://jabber.org/protocol/muc#admin")
+    (fxml:with-element "item"
+      (fxml:attribute "affiliation" "member")
+      (fxml:attribute "jid" jid))))
+
+(defmethod send-direct-room-invite ((backend cl-xmpp-backend)
+                                    connection
+                                    to
+                                    room-jid
+                                    reason)
+  (declare (ignore backend))
+  (xmpp::with-xml-output (connection)
+    (fxml:with-element "message"
+      (fxml:attribute "to" to)
+      (fxml:with-element "x"
+        (fxml:attribute "xmlns" "jabber:x:conference")
+        (fxml:attribute "jid" room-jid)
+        (when (and reason (plusp (length reason)))
+          (fxml:attribute "reason" reason))))))
+
+(defmethod send-room-message ((backend cl-xmpp-backend)
+                              connection
+                              room-jid
+                              body)
+  (declare (ignore backend))
+  (xmpp::with-xml-output (connection)
+    (fxml:with-element "message"
+      (fxml:attribute "to" room-jid)
+      (fxml:attribute "type" "groupchat")
+      (fxml:with-element "body"
+        (fxml:text body)))))
+
+(defmethod destroy-room ((backend cl-xmpp-backend)
+                         connection
+                         room-jid
+                         id
+                         &key reason)
+  (declare (ignore backend))
+  (xmpp:with-iq-query (connection
+                       :id id
+                       :type "set"
+                       :to room-jid
+                       :xmlns "http://jabber.org/protocol/muc#owner")
+    (fxml:with-element "destroy"
+      (when reason
+        (fxml:with-element "reason"
+          (fxml:text reason))))))
+
+(defmethod leave-room ((backend cl-xmpp-backend) connection room-full-jid)
+  (declare (ignore backend))
+  (xmpp::with-xml-output (connection)
+    (fxml:with-element "presence"
+      (fxml:attribute "to" room-full-jid)
+      (fxml:attribute "type" "unavailable"))))
 
 (defmethod close-connection ((backend cl-xmpp-backend) connection)
   (declare (ignore backend))

@@ -48,46 +48,24 @@
 (defun route-code-equal (left right)
   (and left right (string-equal left right)))
 
-(defun yaml-to-route-value (key value)
-  (declare (ignore key))
-  (if (yaml-null-p value) nil value))
-
-(defun route-value-to-yaml (key value)
-  (declare (ignore key))
-  (if value value (yaml-null)))
-
 (defun yaml-to-route (mapping)
   (unless (listp mapping)
     (error "Malformed agent/routes.yaml: route entry must be a mapping."))
-  (yaml-to-plist mapping :value-from-yaml #'yaml-to-route-value))
+  (yaml-to-plist mapping :value-from-yaml #'yaml-null-to-nil))
 
 (defun route-to-yaml (route)
-  (plist-to-yaml route :value-to-yaml #'route-value-to-yaml))
-
-(defun yaml-to-routes-file (yaml)
-  (unless (listp yaml)
-    (error "Malformed agent/routes.yaml: expected a mapping."))
-  (let ((version (yaml-value yaml "version" 1))
-        (routes (yaml-value yaml "routes" nil)))
-    (unless (= version 1)
-      (error "Unsupported agent/routes.yaml version: ~a" version))
-    (unless (listp routes)
-      (error "Malformed agent/routes.yaml: routes must be a list."))
-    (mapcar #'yaml-to-route routes)))
-
-(defun routes-file-to-yaml (routes)
-  (list (cons "version" 1)
-        (cons "routes" (mapcar #'route-to-yaml routes))))
+  (plist-to-yaml route :value-to-yaml #'nil-to-yaml-null))
 
 (defun load-routes-from-disk ()
-  (let ((pathname (routes-pathname)))
-    (if (probe-file pathname)
-        (yaml-to-routes-file (read-yaml-file pathname))
-        nil)))
+  (read-yaml-record-list-file (routes-pathname)
+                              #'yaml-to-route
+                              :label "agent/routes.yaml"))
 
 (defun save-routes-to-disk (routes)
   (ensure-agent-directory)
-  (write-yaml-atomically (routes-pathname) (routes-file-to-yaml routes)))
+  (write-yaml-record-list-file (routes-pathname)
+                               routes
+                               #'route-to-yaml))
 
 (defun load-routes ()
   (load-routes-from-disk))
@@ -97,55 +75,6 @@
    (lambda ()
      (save-routes-to-disk routes))))
 
-(defun parse-fixed-integer (string start end)
-  (parse-integer string :start start :end end :junk-allowed nil))
-
-(defun parse-iso8601-timezone (timestamp position)
-  (let ((marker (and (< position (length timestamp))
-                     (char timestamp position))))
-    (cond
-      ((null marker)
-       nil)
-      ((char= marker #\Z)
-       0)
-      ((or (char= marker #\+) (char= marker #\-))
-       (let* ((hours (parse-fixed-integer timestamp
-                                          (1+ position)
-                                          (+ position 3)))
-              (minutes (parse-fixed-integer timestamp
-                                            (+ position 4)
-                                            (+ position 6)))
-              (offset (+ hours (/ minutes 60))))
-         ;; ENCODE-UNIVERSAL-TIME expects hours west of GMT. ISO-8601
-         ;; offsets use the opposite sign for locations east of GMT.
-         (if (char= marker #\+)
-             (- offset)
-             offset)))
-      (t
-       nil))))
-
-(defun parse-iso8601 (timestamp)
-  (when (and (stringp timestamp)
-             (>= (length timestamp) 19)
-             (char= (char timestamp 4) #\-)
-             (char= (char timestamp 7) #\-)
-             (char= (char timestamp 10) #\T)
-             (char= (char timestamp 13) #\:)
-             (char= (char timestamp 16) #\:))
-    (handler-case
-        (let ((year (parse-fixed-integer timestamp 0 4))
-              (month (parse-fixed-integer timestamp 5 7))
-              (day (parse-fixed-integer timestamp 8 10))
-              (hour (parse-fixed-integer timestamp 11 13))
-              (minute (parse-fixed-integer timestamp 14 16))
-              (second (parse-fixed-integer timestamp 17 19))
-              (timezone (parse-iso8601-timezone timestamp 19)))
-          (if timezone
-              (encode-universal-time second minute hour day month year timezone)
-              (encode-universal-time second minute hour day month year)))
-      (error ()
-        nil))))
-
 (defun route-activity-time (route)
   (let ((times (remove nil
                        (mapcar (lambda (key)
@@ -153,11 +82,20 @@
                                '(:last-used-at :last-seen-at :created-at)))))
     (and times (reduce #'max times))))
 
+(defun route-direct-activity-time (route)
+  (let ((times (remove nil
+                       (mapcar (lambda (key)
+                                 (parse-iso8601 (getf route key)))
+                               '(:last-direct-used-at
+                                 :last-seen-at
+                                 :created-at)))))
+    (and times (reduce #'max times))))
+
 (defun last-active-route (&optional (routes (load-routes)))
   (let ((best nil)
         (best-time nil))
     (dolist (route routes best)
-      (let ((time (or (route-activity-time route) 0)))
+      (let ((time (or (route-direct-activity-time route) 0)))
         (when (or (null best) (> time best-time))
           (setf best route
                 best-time time))))))
@@ -232,6 +170,7 @@
           (list :created-at now
                 :last-seen-at now
                 :last-used-at nil
+                :last-direct-used-at nil
                 :notify-count 1)))
 
 (defun ensure-route (identity &key
@@ -278,7 +217,7 @@
              (save-routes-to-disk new-routes)
              (values route new-routes t)))))))
 
-(defun mark-route-used (route &optional (now (now-iso8601)))
+(defun mark-route-used (route &key (now (now-iso8601)) (direct-p t))
   (call-with-routes-lock
    (lambda ()
      (let* ((routes (load-routes-from-disk))
@@ -286,9 +225,11 @@
             (existing (and route-id (find-route-by-id routes route-id))))
        (unless existing
          (error "Route no longer exists for code ~a." (getf route :code)))
-       (let* ((updated (copy-list existing))
-              (new-routes nil))
-         (setf (getf updated :last-used-at) now)
-         (setf new-routes (cons updated (remove existing routes :test #'eq)))
+         (let* ((updated (copy-list existing))
+                (new-routes nil))
+           (setf (getf updated :last-used-at) now)
+           (when direct-p
+             (setf (getf updated :last-direct-used-at) now))
+           (setf new-routes (cons updated (remove existing routes :test #'eq)))
          (save-routes-to-disk new-routes)
          updated)))))

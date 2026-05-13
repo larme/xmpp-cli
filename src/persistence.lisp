@@ -31,6 +31,34 @@
         append (list (yaml-key-to-keyword key)
                      (funcall value-from-yaml key value))))
 
+(defun yaml-null-to-nil (key value)
+  (declare (ignore key))
+  (if (yaml-null-p value) nil value))
+
+(defun nil-to-yaml-null (key value)
+  (declare (ignore key))
+  (if value value (yaml-null)))
+
+(defun yaml-record-p (value)
+  (and (listp value)
+       (every (lambda (entry)
+                (and (consp entry)
+                     (stringp (car entry))))
+              value)))
+
+(defun read-yaml-record-list-file (pathname item-from-yaml
+                                   &key (label (namestring pathname)))
+  (if (probe-file pathname)
+      (let ((yaml (read-yaml-file pathname)))
+        (unless (and (listp yaml)
+                     (every #'yaml-record-p yaml))
+          (error "Malformed ~a: expected a top-level list of mappings." label))
+        (mapcar item-from-yaml yaml))
+      nil))
+
+(defun write-yaml-record-list-file (pathname items item-to-yaml)
+  (write-yaml-atomically pathname (mapcar item-to-yaml items)))
+
 (defun temporary-sibling-pathname (target)
   (merge-pathnames
    (format nil "~a.~36r.~36r.tmp"

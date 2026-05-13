@@ -19,8 +19,8 @@
 (defun validate-config (config)
   (unless (proper-plist-p config)
     (error "Malformed config.yaml: expected a property list, got ~s" config))
-  (let ((default (getf config :default-profile *default-profile-name*))
-        (profiles (getf config :profiles nil)))
+  (let ((default (getf config :default-profile))
+        (profiles (getf config :profiles)))
     (unless (stringp default)
       (error "Malformed config.yaml: default_profile must be a string."))
     (unless (listp profiles)
@@ -66,12 +66,16 @@
 (defun yaml-to-config (yaml)
   (unless (listp yaml)
     (error "Malformed config.yaml: expected a mapping."))
+  (unless (assoc "default_profile" yaml :test #'string=)
+    (error "Malformed config.yaml: missing required key default_profile."))
+  (unless (assoc "profiles" yaml :test #'string=)
+    (error "Malformed config.yaml: missing required key profiles."))
   (validate-config
    (list :default-profile (yaml-value yaml
                                       "default_profile"
-                                      *default-profile-name*)
+                                      nil)
          :profiles (mapcar #'yaml-to-profile-entry
-                           (yaml-value yaml "profiles" nil)))))
+                            (yaml-value yaml "profiles" nil)))))
 
 (defun read-config-file (pathname)
   (yaml-to-config (read-yaml-file pathname)))
@@ -88,7 +92,7 @@
   (write-yaml-atomically (config-pathname) (config-to-yaml config)))
 
 (defun default-profile-name (config)
-  (or (getf config :default-profile) *default-profile-name*))
+  (getf config :default-profile))
 
 (defun profile (config name)
   (let ((entry (assoc name (getf config :profiles) :test #'string=)))

@@ -63,12 +63,14 @@
                                      :sha256 "def"
                                      :result :failed
                                      :error "no route")
-    (let* ((text (xmpp-cli/util:read-file-as-string
-                  (xmpp-cli/history:history-pathname)))
-           (history (xmpp-cli/history::load-history)))
-      (check-equal 2 (length history))
-      (check (not (search "secret message body" text))
-             "history should not contain message bodies"))))
+	    (let* ((text (xmpp-cli/util:read-file-as-string
+	                  (xmpp-cli/history:history-pathname)))
+	           (history (xmpp-cli/history::load-history)))
+	      (check-equal 2 (length history))
+	      (check (not (search "entries:" text))
+	             "history should be stored as a top-level YAML list")
+	      (check (not (search "secret message body" text))
+	             "history should not contain message bodies"))))
 
 (deftest history-is-yaml-not-reader-syntax
   (with-isolated-data
@@ -76,7 +78,7 @@
     (xmpp-cli/util:write-private-file
      (xmpp-cli/history:history-pathname)
      (format nil
-             "entries:~%  - time: \"#.(setf xmpp-cli/test::*reader-eval-ran* t)\"~%    profile: \"default\"~%"))
+             "- time: \"#.(setf xmpp-cli/test::*reader-eval-ran* t)\"~%  profile: \"default\"~%"))
     (let ((history (xmpp-cli/history::load-history)))
       (check-equal "#.(setf xmpp-cli/test::*reader-eval-ran* t)"
                    (getf (first history) :time)))

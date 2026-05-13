@@ -104,6 +104,55 @@
       (format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0d~c~2,'0d:~2,'0d"
               year month day hour minute second sign offset-hours offset-rest-minutes))))
 
+(defun parse-fixed-integer (string start end)
+  (parse-integer string :start start :end end :junk-allowed nil))
+
+(defun parse-iso8601-timezone (timestamp position)
+  (let ((marker (and (< position (length timestamp))
+                     (char timestamp position))))
+    (cond
+      ((null marker)
+       nil)
+      ((char= marker #\Z)
+       0)
+      ((or (char= marker #\+) (char= marker #\-))
+       (let* ((hours (parse-fixed-integer timestamp
+                                          (1+ position)
+                                          (+ position 3)))
+              (minutes (parse-fixed-integer timestamp
+                                            (+ position 4)
+                                            (+ position 6)))
+              (offset (+ hours (/ minutes 60))))
+         ;; ENCODE-UNIVERSAL-TIME expects hours west of GMT. ISO-8601
+         ;; offsets use the opposite sign for locations east of GMT.
+         (if (char= marker #\+)
+             (- offset)
+             offset)))
+      (t
+       nil))))
+
+(defun parse-iso8601 (timestamp)
+  (when (and (stringp timestamp)
+             (>= (length timestamp) 19)
+             (char= (char timestamp 4) #\-)
+             (char= (char timestamp 7) #\-)
+             (char= (char timestamp 10) #\T)
+             (char= (char timestamp 13) #\:)
+             (char= (char timestamp 16) #\:))
+    (handler-case
+        (let ((year (parse-fixed-integer timestamp 0 4))
+              (month (parse-fixed-integer timestamp 5 7))
+              (day (parse-fixed-integer timestamp 8 10))
+              (hour (parse-fixed-integer timestamp 11 13))
+              (minute (parse-fixed-integer timestamp 14 16))
+              (second (parse-fixed-integer timestamp 17 19))
+              (timezone (parse-iso8601-timezone timestamp 19)))
+          (if timezone
+              (encode-universal-time second minute hour day month year timezone)
+              (encode-universal-time second minute hour day month year)))
+      (error ()
+        nil))))
+
 (defun current-process-id ()
   #+sbcl
   (or (ignore-errors (sb-posix:getpid)) nil)

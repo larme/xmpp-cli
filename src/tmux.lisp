@@ -235,6 +235,22 @@
                    *tmux-pane-location-format*)
              :socket socket)))
 
+(defun pane-exists-p (route)
+  (let ((pane-id (getf route :tmux-pane-id))
+        (socket (getf route :tmux-socket)))
+    (and pane-id
+         (handler-case
+             (string= pane-id
+                      (trim-line-end
+                       (run-tmux (list "display-message"
+                                       "-p"
+                                       "-t"
+                                       pane-id
+                                       "#{pane_id}")
+                                 :socket socket)))
+           (error ()
+             nil)))))
+
 (defun list-clients (&key session-id socket)
   (handler-case
       (let ((arguments (append (list "list-clients")

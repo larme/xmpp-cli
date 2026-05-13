@@ -274,8 +274,17 @@
 (defun build-body (prefix-lines detail)
   (join-lines (body-lines-with-detail prefix-lines detail)))
 
+(defun notification-target-for-route (route fallback-jid)
+  (if route
+      (list :kind :route
+            :route-id (getf route :route-id)
+            :route-code (getf route :code)
+            :fallback-jid fallback-jid)
+      (list :kind :jid
+            :jid fallback-jid)))
+
 (defun build-codex-notification (payload config &key tmux-context host cwd)
-  (let* ((target (notify-to config))
+  (let* ((fallback-jid (notify-to config))
          (host (short-hostname host))
          (cwd (or (payload-value payload "cwd" nil)
                   cwd
@@ -292,7 +301,7 @@
                                                   display-cwd))
          (detail (notification-detail payload))
          (body (build-body prefix-lines detail)))
-    (make-notification :target target
+    (make-notification :target (notification-target-for-route route fallback-jid)
                        :body body
                        :bodies (split-notification-body prefix-lines detail)
                        :route route)))

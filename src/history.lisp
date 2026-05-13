@@ -25,29 +25,16 @@
     (error "Malformed history.yaml: history entry must be a mapping."))
   (yaml-to-plist mapping :value-from-yaml #'yaml-value-to-history-value))
 
-(defun history-to-yaml (history)
-  (list (cons "entries" (mapcar #'history-entry-to-yaml history))))
-
-(defun yaml-to-history (yaml)
-  (unless (listp yaml)
-    (error "Malformed history.yaml: expected a mapping."))
-  (let ((entries (yaml-value yaml "entries" nil)))
-    (unless (listp entries)
-      (error "Malformed history.yaml: entries must be a list."))
-    (mapcar #'yaml-to-history-entry entries)))
-
-(defun read-history-file (pathname)
-  (yaml-to-history (read-yaml-file pathname)))
-
 (defun load-history ()
-  (let ((pathname (history-pathname)))
-    (if (probe-file pathname)
-        (read-history-file pathname)
-        nil)))
+  (read-yaml-record-list-file (history-pathname)
+                              #'yaml-to-history-entry
+                              :label "history.yaml"))
 
 (defun save-history (history)
   (ensure-private-directory)
-  (write-yaml-atomically (history-pathname) (history-to-yaml history)))
+  (write-yaml-record-list-file (history-pathname)
+                               history
+                               #'history-entry-to-yaml))
 
 (defun append-history (&key profile to kind body bytes sha256 result error)
   (declare (ignore body))

@@ -4,6 +4,7 @@
 (defparameter *control-io-timeout-seconds* 10)
 (defparameter *max-ipc-frame-octets* (* 1024 1024))
 (defparameter *max-ipc-frame-length-line-chars* 20)
+(defparameter *daemon-stop-wait-seconds* 5)
 
 (defun control-pathname ()
   (merge-pathnames "control.yaml" (agent-directory)))
@@ -297,6 +298,21 @@
       (t
        (values nil nil error)))))
 
+(defun daemon-notify (route-id fallback-to body &key expected-profile-digest)
+  (multiple-value-bind (response error)
+      (request-control (list :op :notify
+                             :route-id route-id
+                             :fallback-to fallback-to
+                             :body body
+                             :expected-profile-digest expected-profile-digest))
+    (cond
+      ((and (listp response) (getf response :ok))
+       (values t response nil))
+      (response
+       (values nil response (daemon-response-error response "daemon notify failed")))
+      (t
+       (values nil nil error)))))
+
 (defun daemon-status ()
   (multiple-value-bind (response error) (request-control (list :op :status))
     (cond
@@ -314,5 +330,33 @@
        (values t response nil))
       (response
        (values nil response (daemon-response-error response "daemon stop failed")))
+      (t
+       (values nil nil error)))))
+
+(defun daemon-runtime-files-present-p ()
+  (or (probe-file (control-pathname))
+      (probe-file (daemon-lock-pathname))))
+
+(defun wait-for-daemon-stop (&key (timeout-seconds *daemon-stop-wait-seconds*)
+                                  (poll-seconds 0.1))
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout-seconds
+                               internal-time-units-per-second)))))
+    (loop
+      (unless (daemon-runtime-files-present-p)
+        (return t))
+      (when (>= (get-internal-real-time) deadline)
+        (return nil))
+      (sleep poll-seconds))))
+
+(defun daemon-discover-muc (&key force)
+  (multiple-value-bind (response error)
+      (request-control (list :op :discover-muc
+                             :force force))
+    (cond
+      ((and (listp response) (getf response :ok))
+       (values t response nil))
+      (response
+       (values nil response (daemon-response-error response "MUC discovery failed")))
       (t
        (values nil nil error)))))

@@ -10,13 +10,19 @@
                       config
                       "user@example.org")))
         (xmpp-cli/agent-config:save-agent-config updated)
-        (let* ((text (xmpp-cli/util:read-file-as-string
+      (let* ((text (xmpp-cli/util:read-file-as-string
                       (xmpp-cli/agent-config:agent-config-pathname)))
                (loaded (xmpp-cli/agent-config:load-agent-config)))
           (check (search "notify_to" text)
                  "agent config should be written as YAML")
+          (check (search "room_public: false" text)
+                 "agent config should write room booleans as YAML booleans")
           (check-equal "user@example.org"
                        (getf loaded :notify-to))
+          (check-equal nil (getf loaded :room-public))
+          (check-equal nil (getf loaded :room-persistent))
+          (check-equal t (getf loaded :room-members-only))
+          (check-equal "moderators" (getf loaded :room-whois))
           (check-equal '("user@example.org")
                        (getf loaded :allowed-senders)))))))
 
@@ -88,10 +94,16 @@
                               :created-at old-time
                               :last-seen-at old-time
                               :last-used-at fresh-time)))
-      (xmpp-cli/agent-routes:save-routes (list old-route fresh-route))
-      (check (null (xmpp-cli/agent-routes:find-active-route-by-code
-                    "oldc"
-                    1))
+	      (xmpp-cli/agent-routes:save-routes (list old-route fresh-route))
+	      (let ((text (xmpp-cli/util:read-file-as-string
+	                   (xmpp-cli/agent-routes:routes-pathname))))
+	        (check (not (search "version:" text))
+	               "routes should not carry a compatibility version wrapper")
+	        (check (not (search "routes:" text))
+	               "routes should be stored as a top-level YAML list"))
+	      (check (null (xmpp-cli/agent-routes:find-active-route-by-code
+	                    "oldc"
+	                    1))
              "expired route codes should not match")
       (let ((matched (xmpp-cli/agent-routes:find-active-route-by-code
                       "NEWC"
@@ -207,7 +219,8 @@
       (xmpp-cli/agent-config:save-agent-config without-sender)
       (let ((loaded (xmpp-cli/agent-config:load-agent-config)))
         (check-equal "user@example.org" (getf loaded :notify-to))
-        (check-equal nil (getf loaded :allowed-senders))))))
+        (check-equal nil (getf loaded :allowed-senders))
+        (check-equal nil (xmpp-cli/agent-config:allowed-senders loaded))))))
 
 (deftest daemon-lock-is-exclusive-and-token-owned
   (with-isolated-data
@@ -284,6 +297,10 @@
         (ignore-errors
           (bt:destroy-thread thread))))))
 
+(deftest daemon-handle-client-ignores-nil-socket
+  (check (null (xmpp-cli/agent-daemon::handle-client nil nil))
+         "nil control sockets should be ignored"))
+
 (deftest daemon-ipc-frame-round-trips-newline-payload
   (let* ((body (format nil "hello~%world I~cm fine" (code-char #x2019)))
          (message (list :op :send
@@ -345,6 +362,847 @@
                    :expected-profile-digest digest))))
       (check (search "connection is not ready" (getf response :error))
              "matching digest should reach the normal send path"))))
+
+(defun test-xml-attribute (name value)
+  (make-instance 'xmpp:xml-attribute
+                 :name name
+                 :value value))
+
+(defun test-xml-element (name &key attributes elements data)
+  (make-instance 'xmpp:xml-element
+                 :name name
+                 :attributes attributes
+                 :elements elements
+                 :data data))
+
+(deftest backend-classifies-raw-stanzas
+  (let* ((body (test-xml-element
+                :body
+                :elements (list (test-xml-element :\#text :data "hello"))))
+         (message (test-xml-element
+                   :message
+                   :attributes (list (test-xml-attribute :from
+                                                         "room@example.org/user")
+                                     (test-xml-attribute :to
+                                                         "bot@example.org")
+                                     (test-xml-attribute :id "m1")
+                                     (test-xml-attribute :type "groupchat"))
+                   :elements (list body)))
+         (stanza (xmpp-cli/backend/cl-xmpp::event-stanza-plist message)))
+    (check-equal :groupchat (getf stanza :kind))
+    (check-equal "room@example.org/user" (getf stanza :from))
+    (check-equal "hello" (getf stanza :body)))
+  (let* ((query (test-xml-element
+                 :query
+                 :attributes (list (test-xml-attribute
+                                    :xmlns
+                                    "http://jabber.org/protocol/disco#info"))))
+         (iq (test-xml-element
+              :iq
+              :attributes (list (test-xml-attribute :from "example.org")
+                                (test-xml-attribute :id "disco-1")
+                                (test-xml-attribute :type "result"))
+              :elements (list query)))
+         (stanza (xmpp-cli/backend/cl-xmpp::event-stanza-plist iq)))
+    (check-equal :iq (getf stanza :kind))
+    (check-equal "disco-1" (getf stanza :id))
+    (check-equal "http://jabber.org/protocol/disco#info"
+                 (getf stanza :query-xmlns))
+    (check-equal nil (getf stanza :disco-features)))
+  (let* ((identity (test-xml-element
+                    :identity
+                    :attributes (list (test-xml-attribute :category
+                                                          "conference")
+                                      (test-xml-attribute :type "text"))))
+         (feature (test-xml-element
+                   :feature
+                   :attributes (list (test-xml-attribute
+                                      :var
+                                      xmpp-cli/agent-muc:+muc-feature+))))
+         (query (test-xml-element
+                 :query
+                 :attributes (list (test-xml-attribute
+                                    :xmlns
+                                    xmpp-cli/agent-muc:+disco-info-xmlns+))
+                 :elements (list identity feature)))
+         (iq (test-xml-element
+              :iq
+              :attributes (list (test-xml-attribute :id "disco-2")
+                                (test-xml-attribute :type "result"))
+              :elements (list query)))
+         (stanza (xmpp-cli/backend/cl-xmpp::event-stanza-plist iq)))
+    (check-equal (list xmpp-cli/agent-muc:+muc-feature+)
+                 (getf stanza :disco-features))
+    (check-equal "conference"
+                 (getf (first (getf stanza :disco-identities))
+                       :category)))
+  (let* ((item (test-xml-element
+                :item
+                :attributes (list (test-xml-attribute :jid
+                                                      "conference.example.org")
+                                  (test-xml-attribute :name "Rooms"))))
+         (query (test-xml-element
+                 :query
+                 :attributes (list (test-xml-attribute
+                                    :xmlns
+                                    xmpp-cli/agent-muc:+disco-items-xmlns+))
+                 :elements (list item)))
+         (iq (test-xml-element
+              :iq
+              :attributes (list (test-xml-attribute :id "items-1")
+                                (test-xml-attribute :type "result"))
+              :elements (list query)))
+         (stanza (xmpp-cli/backend/cl-xmpp::event-stanza-plist iq)))
+    (check-equal "conference.example.org"
+                 (getf (first (getf stanza :disco-items)) :jid)))
+
+  (let* ((muc-item (test-xml-element
+                    :item
+                    :attributes (list (test-xml-attribute :jid
+                                                          "user@example.org/phone")
+                                      (test-xml-attribute :affiliation "member")
+                                      (test-xml-attribute :role "participant"))))
+         (status (test-xml-element
+                  :status
+                  :attributes (list (test-xml-attribute :code "201"))))
+         (x (test-xml-element
+             :x
+             :attributes (list (test-xml-attribute
+                                :xmlns
+                                "http://jabber.org/protocol/muc#user"))
+             :elements (list muc-item status)))
+         (presence (test-xml-element
+                    :presence
+                    :attributes (list (test-xml-attribute
+                                       :from
+                                       "room@groups.example.org/larme"))
+                    :elements (list x)))
+         (stanza (xmpp-cli/backend/cl-xmpp::event-stanza-plist presence)))
+    (check-equal :presence (getf stanza :kind))
+    (check-equal "room@groups.example.org" (getf stanza :room-jid))
+    (check-equal "larme" (getf stanza :room-nick))
+    (check-equal "user@example.org/phone" (getf stanza :muc-jid))
+    (check-equal '("201") (getf stanza :muc-status-codes))))
+
+(deftest muc-service-selection-prefers-conference-domain
+  (let ((candidates
+          (list
+           (list :jid "rooms.example.org"
+                 :identities (list (list :category "conference"
+                                         :type "text"))
+                 :features (list xmpp-cli/agent-muc:+muc-feature+))
+           (list :jid "conference.example.org"
+                 :identities (list (list :category "conference"
+                                         :type "text"))
+                 :features (list xmpp-cli/agent-muc:+muc-feature+)))))
+    (multiple-value-bind (selected status considered)
+        (xmpp-cli/agent-muc:select-muc-service "example.org" candidates)
+      (check-equal :ok status)
+      (check-equal "conference.example.org" (getf selected :jid))
+      (check-equal 2 (length considered)))))
+
+(deftest muc-service-selection-reports-ambiguous-candidates
+  (let ((candidates
+          (list
+           (list :jid "rooms-a.example.org"
+                 :features (list xmpp-cli/agent-muc:+muc-feature+))
+           (list :jid "rooms-b.example.org"
+                 :features (list xmpp-cli/agent-muc:+muc-feature+)))))
+    (multiple-value-bind (selected status considered)
+        (xmpp-cli/agent-muc:select-muc-service "example.org" candidates)
+      (check (null selected) "ambiguous discovery should not choose a service")
+      (check-equal :ambiguous status)
+      (check-equal 2 (length considered)))))
+
+(deftest muc-service-discovery-caches-result
+  (with-isolated-data
+    (let* ((config (xmpp-cli/agent-config:load-agent-config))
+           (items-calls 0)
+           (info-calls 0)
+           (items (list (list :jid "conference.example.org"
+                              :name "Rooms"))))
+      (labels ((request-items (domain)
+                 (incf items-calls)
+                 (check-equal "example.org" domain)
+                 items)
+               (request-info (jid)
+                 (incf info-calls)
+                 (check-equal "conference.example.org" jid)
+                 (list :identities (list (list :category "conference"
+                                               :type "text"))
+                       :features (list xmpp-cli/agent-muc:+muc-feature+))))
+        (let ((result (xmpp-cli/agent-muc:resolve-muc-service
+                       "example.org"
+                       config
+                       #'request-items
+                       #'request-info)))
+          (check-equal "conference.example.org" (getf result :service-jid))
+          (check-equal :discovered (getf result :source))
+          (check-equal 1 items-calls)
+          (check-equal 1 info-calls))
+	        (let ((cached (xmpp-cli/agent-muc:resolve-muc-service
+	                       "example.org"
+	                       config
+	                       (lambda (domain)
+	                         (declare (ignore domain))
+	                         (error "cache should avoid disco#items"))
+	                       #'request-info)))
+	          (let ((text (xmpp-cli/util:read-file-as-string
+	                       (xmpp-cli/agent-muc:muc-services-pathname))))
+	            (check (not (search "version:" text))
+	                   "MUC cache should not carry a compatibility version wrapper")
+	            (check (not (search "services:" text))
+	                   "MUC cache should be stored as a top-level YAML list"))
+	          (check-equal "conference.example.org" (getf cached :service-jid))
+	          (check-equal :cache (getf cached :source)))))))
+
+(defvar *room-test-state* nil)
+(defvar *slow-room-join-count* 0)
+(defvar *fake-destroy-room-replies-p* t)
+(defvar *slow-room-join-lock*
+  (bt:make-lock "xmpp-cli slow room test"))
+
+(deftest room-state-round-trips-yaml
+  (with-isolated-data
+    (let ((room (list :room-jid "xmppcli-abcd-room-test@groups.example.org"
+                      :room-nick "xmpp-cli"
+                      :route-id "route-1"
+                      :route-code "abcd"
+                      :service-jid "groups.example.org"
+                      :room-name "room test"
+                      :invited-jids '("user@example.org")
+                      :created-at "2026-05-12T00:00:00+08:00"
+	                      :last-activity-at "2026-05-12T00:00:00+08:00"
+	                      :state "active")))
+	      (xmpp-cli/agent-rooms:save-rooms (list room))
+	      (let ((text (xmpp-cli/util:read-file-as-string
+	                   (xmpp-cli/agent-rooms:rooms-pathname))))
+	        (check (not (search "version:" text))
+	               "rooms should not carry a compatibility version wrapper")
+	        (check (not (search "rooms:" text))
+	               "rooms should be stored as a top-level YAML list"))
+	      (let ((loaded (first (xmpp-cli/agent-rooms:load-rooms))))
+        (check-equal "xmppcli-abcd-room-test@groups.example.org"
+                     (getf loaded :room-jid))
+        (check-equal '("user@example.org")
+                     (getf loaded :invited-jids))
+        (check-equal room
+                     (xmpp-cli/agent-rooms:find-active-room-by-jid
+                      "xmppcli-abcd-room-test@groups.example.org/user"))))))
+
+(deftest room-close-lookup-and-mark-closed
+  (with-isolated-data
+    (let ((room (list :room-jid "room@groups.example.org"
+                      :room-nick "xmpp-cli"
+                      :route-id "route-1"
+                      :route-code "abcd"
+                      :created-at "2026-05-12T00:00:00+08:00"
+                      :last-activity-at "2026-05-12T00:00:00+08:00"
+                      :state "active")))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (check-equal "room@groups.example.org"
+                   (getf (xmpp-cli/agent-daemon::find-room-for-close "ABCD")
+                         :room-jid))
+      (xmpp-cli/agent-rooms:mark-room-closed room
+                                             "2026-05-12T00:05:00+08:00")
+      (check (null (xmpp-cli/agent-daemon::find-room-for-close "abcd"))
+             "closed rooms should not match /room-close lookup")
+      (check-equal '("room@groups.example.org route=abcd state=closed last=2026-05-12T00:00:00+08:00")
+                   (xmpp-cli/agent-rooms:room-summary-lines
+                    (xmpp-cli/agent-rooms:load-rooms))))))
+
+(deftest room-close-marks-local-room-closed-on-destroy-timeout
+  (with-isolated-data
+    (let* ((room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (let ((*fake-events* nil)
+            (*room-test-state* state)
+            (*fake-destroy-room-replies-p* nil)
+            (xmpp-cli/agent-daemon::*default-iq-timeout-seconds* 0))
+        (multiple-value-bind (destroyed destroy-error)
+            (xmpp-cli/agent-daemon::close-room
+             state
+             room
+             :reason "test close")
+          (check (null destroyed)
+                 "server destroy should be reported as not acknowledged")
+          (check destroy-error
+                 "destroy timeout should be returned to the caller")
+          (check-equal "closed"
+                       (getf (first (xmpp-cli/agent-rooms:load-rooms))
+                             :state))
+          (check (some (lambda (event)
+                         (eq (first event) :destroy-room))
+                       *fake-events*)
+                 "close should still try the owner destroy IQ")
+          (check (some (lambda (event)
+                         (eq (first event) :leave-room))
+                       *fake-events*)
+                 "close should leave the MUC even if destroy is not acknowledged"))))))
+
+(deftest room-state-keeps-one-active-room-per-route
+  (with-isolated-data
+    (let ((old-room (list :room-jid "old@groups.example.org"
+                          :route-id "route-1"
+                          :route-code "abcd"
+                          :created-at "2026-05-12T00:00:00+08:00"
+                          :state "active"))
+          (new-room (list :room-jid "new@groups.example.org"
+                          :route-id "route-1"
+                          :route-code "abcd"
+                          :created-at "2026-05-12T00:01:00+08:00"
+                          :state "active")))
+      (xmpp-cli/agent-rooms:save-rooms (list old-room))
+      (xmpp-cli/agent-rooms:upsert-room new-room)
+      (let ((rooms (xmpp-cli/agent-rooms:active-rooms)))
+        (check-equal 1 (length rooms))
+        (check-equal "new@groups.example.org"
+                     (getf (first rooms) :room-jid))))))
+
+(deftest room-slug-and-occupant-parsing
+  (check-equal "parser-fix"
+               (xmpp-cli/agent-rooms:sanitize-room-slug "Parser fix!"))
+  (check-equal "room"
+               (xmpp-cli/agent-rooms:sanitize-room-slug "!!!"))
+  (multiple-value-bind (room nick)
+      (xmpp-cli/agent-rooms:parse-room-occupant-jid
+       "xmppcli-abcd-room@groups.example.org/larme")
+    (check-equal "xmppcli-abcd-room@groups.example.org" room)
+    (check-equal "larme" nick)))
+
+(deftest room-command-requires-explicit-route
+  (multiple-value-bind (route-code room-name)
+      (xmpp-cli/agent-daemon::parse-room-command-arguments
+       "ABCD parser fix")
+    (check-equal "abcd" route-code)
+    (check-equal "parser fix" room-name))
+  (multiple-value-bind (route-code room-name)
+      (xmpp-cli/agent-daemon::parse-room-command-arguments "")
+    (check (null route-code) "empty /room should not produce a route")
+    (check (null room-name) "empty /room should not produce a room name")))
+
+(deftest room-config-fields-respect-returned-form
+  (let* ((requested (xmpp-cli/agent-daemon::requested-room-config-fields
+                    (list :room-public nil
+                          :room-persistent nil
+                          :room-members-only t
+                          :room-whois "moderators")
+                    "Parser Fix"))
+         (selected (xmpp-cli/agent-daemon::select-room-config-fields
+                    (list (list :var "FORM_TYPE")
+                          (list :var "muc#roomconfig_roomname")
+                          (list :var "muc#roomconfig_membersonly"))
+                    requested)))
+    (check-equal '("FORM_TYPE"
+                   "muc#roomconfig_roomname"
+                   "muc#roomconfig_membersonly")
+                 (mapcar #'first selected))))
+
+(defclass slow-room-backend (fake-backend) ())
+
+(defmethod xmpp-cli/backend:join-room ((backend fake-backend)
+                                       connection
+                                       room-full-jid)
+  (declare (ignore backend connection))
+  (push (list :join-room room-full-jid) *fake-events*)
+  (xmpp-cli/agent-daemon::resolve-pending-room-join
+   *room-test-state*
+   (list :kind :presence
+         :from room-full-jid
+         :muc-status-codes '("201"))))
+
+(defmethod xmpp-cli/backend:join-room ((backend slow-room-backend)
+                                       connection
+                                       room-full-jid)
+  (declare (ignore backend connection))
+  (bt:with-lock-held (*slow-room-join-lock*)
+    (incf *slow-room-join-count*))
+  (sleep 0.2)
+  (xmpp-cli/agent-daemon::resolve-pending-room-join
+   *room-test-state*
+   (list :kind :presence
+         :from room-full-jid
+         :muc-status-codes '("201"))))
+
+(defmethod xmpp-cli/backend:request-room-config ((backend fake-backend)
+                                                 connection
+                                                 room-jid
+                                                 id)
+  (declare (ignore backend connection))
+  (push (list :request-room-config room-jid id) *fake-events*)
+  (xmpp-cli/agent-daemon::resolve-pending-iq
+   *room-test-state*
+   (list :kind :iq
+         :id id
+         :type "result"
+         :data-form-fields (list (list :var "FORM_TYPE")
+                                 (list :var "muc#roomconfig_roomname")
+                                 (list :var "muc#roomconfig_membersonly")))))
+
+(defmethod xmpp-cli/backend:submit-room-config ((backend fake-backend)
+                                                connection
+                                                room-jid
+                                                id
+                                                fields)
+  (declare (ignore backend connection))
+  (push (list :submit-room-config room-jid fields) *fake-events*)
+  (xmpp-cli/agent-daemon::resolve-pending-iq
+   *room-test-state*
+   (list :kind :iq :id id :type "result")))
+
+(defmethod xmpp-cli/backend:grant-room-membership ((backend fake-backend)
+                                                   connection
+                                                   room-jid
+                                                   id
+                                                   jid)
+  (declare (ignore backend connection))
+  (push (list :grant-room-membership room-jid jid) *fake-events*)
+  (xmpp-cli/agent-daemon::resolve-pending-iq
+   *room-test-state*
+   (list :kind :iq :id id :type "result")))
+
+(defmethod xmpp-cli/backend:send-direct-room-invite ((backend fake-backend)
+                                                    connection
+                                                    to
+                                                    room-jid
+                                                    reason)
+  (declare (ignore backend connection))
+  (push (list :send-direct-room-invite to room-jid reason) *fake-events*)
+  :sent)
+
+(defmethod xmpp-cli/backend:send-connected-text ((backend fake-backend)
+                                                connection
+                                                to
+                                                body)
+  (declare (ignore backend connection))
+  (push (list :send-connected-text to body) *fake-events*)
+  :sent)
+
+(defmethod xmpp-cli/backend:send-room-message ((backend fake-backend)
+                                               connection
+                                               room-jid
+                                               body)
+  (declare (ignore backend connection))
+  (push (list :send-room-message room-jid body) *fake-events*)
+  :sent)
+
+(defmethod xmpp-cli/backend:destroy-room ((backend fake-backend)
+                                          connection
+                                          room-jid
+                                          id
+                                          &key reason)
+  (declare (ignore backend connection))
+  (push (list :destroy-room room-jid id reason) *fake-events*)
+  (when *fake-destroy-room-replies-p*
+    (xmpp-cli/agent-daemon::resolve-pending-iq
+     *room-test-state*
+     (list :kind :iq :id id :type "result"))))
+
+(defmethod xmpp-cli/backend:leave-room ((backend fake-backend)
+                                        connection
+                                        room-full-jid)
+  (declare (ignore backend connection))
+  (push (list :leave-room room-full-jid) *fake-events*)
+  :sent)
+
+(deftest room-rejoin-repairs-recreated-room
+  (let* ((state (xmpp-cli/agent-daemon::make-daemon-state
+                 :backend (make-instance 'fake-backend)
+                 :connection :fake-connection
+                 :xmpp-status :connected
+                 :agent-config (list :room-nick "xmpp-cli"
+                                     :room-public nil
+                                     :room-persistent nil
+                                     :room-members-only t
+                                     :room-whois "moderators")))
+         (room (list :room-jid "room@groups.example.org"
+                     :room-nick "xmpp-cli"
+                     :route-code "abcd"
+                     :room-name "room test"
+                     :invited-jids '("user@example.org"
+                                     "notify@example.org"))))
+    (let ((*room-test-state* state)
+          (*fake-events* nil))
+      (xmpp-cli/agent-daemon::rejoin-room state room)
+      (let ((events (reverse *fake-events*)))
+        (check-equal :join-room (caar events))
+        (check-equal '("user@example.org" "notify@example.org")
+                     (mapcar #'third
+                             (remove-if-not
+                              (lambda (event)
+                                (eq (first event) :grant-room-membership))
+                              events)))
+        (check-equal '("user@example.org" "notify@example.org")
+                     (mapcar #'second
+                             (remove-if-not
+                              (lambda (event)
+                                (eq (first event) :send-direct-room-invite))
+                              events)))))))
+
+(deftest concurrent-room-commands-create-one-room
+  (let ((old-data-directory xmpp-cli/util::*data-directory*)
+        (old-room-test-state *room-test-state*)
+        (old-join-count *slow-room-join-count*)
+        (thread-a nil)
+        (thread-b nil))
+    (unwind-protect
+         (let* ((data-directory (make-test-directory))
+                (state nil)
+                (route (list :route-id "route-1"
+                             :code "abcd"))
+                (result-a nil)
+                (result-b nil)
+                (error-a nil)
+                (error-b nil))
+           (setf xmpp-cli/util::*data-directory* data-directory)
+           (xmpp-cli/agent-muc:cache-muc-service "example.org"
+                                                 "groups.example.org")
+           (setf state
+                 (xmpp-cli/agent-daemon::make-daemon-state
+                  :backend (make-instance 'slow-room-backend)
+                  :connection :fake-connection
+                  :xmpp-status :connected
+                  :profile (list :jid "bot@example.org"
+                                 :domain "example.org")
+                  :agent-config (list :notify-to "user@example.org"
+                                      :room-nick "xmpp-cli"
+                                      :room-public nil
+                                      :room-persistent nil
+                                      :room-members-only t
+                                      :room-whois "moderators")))
+           (flet ((create-room ()
+                    (multiple-value-list
+                     (xmpp-cli/agent-daemon::create-room-binding
+                      state
+                      "user@example.org/phone"
+                      route
+                      "race"))))
+             (setf *room-test-state* state)
+             (setf *slow-room-join-count* 0)
+             (setf thread-a
+                   (bt:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf result-a (create-room))
+                        (error (condition)
+                          (setf error-a condition))))
+                    :name "xmpp-cli test room race a"))
+             (sleep 0.05)
+             (setf thread-b
+                   (bt:make-thread
+                    (lambda ()
+                      (handler-case
+                          (setf result-b (create-room))
+                        (error (condition)
+                          (setf error-b condition))))
+                    :name "xmpp-cli test room race b"))
+             (loop repeat 50
+                   while (or (and thread-a (bt:thread-alive-p thread-a))
+                             (and thread-b (bt:thread-alive-p thread-b)))
+                   do (sleep 0.1))
+             (check (not (and thread-a (bt:thread-alive-p thread-a)))
+                    "first room worker should finish")
+             (check (not (and thread-b (bt:thread-alive-p thread-b)))
+                    "second room worker should finish")
+             (check (null error-a)
+                    "first room worker failed: ~a"
+                    error-a)
+             (check (null error-b)
+                    "second room worker failed: ~a"
+                    error-b)
+             (check-equal 1 *slow-room-join-count*)
+             (check-equal 1 (length (xmpp-cli/agent-rooms:active-rooms)))
+             (check-equal 1
+                          (count t
+                                 (list (second result-a)
+                                       (second result-b))))))
+      (when (and thread-a (bt:thread-alive-p thread-a))
+        (ignore-errors
+          (bt:destroy-thread thread-a)))
+      (when (and thread-b (bt:thread-alive-p thread-b))
+        (ignore-errors
+          (bt:destroy-thread thread-b)))
+      (setf xmpp-cli/util::*data-directory* old-data-directory)
+      (setf *room-test-state* old-room-test-state)
+      (setf *slow-room-join-count* old-join-count))))
+
+(deftest daemon-notify-routes-to-bound-room
+  (with-isolated-data
+    (let* ((profile (test-profile))
+           (digest (xmpp-cli/agent-ipc:profile-digest profile))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :profile (list :jid "bot@example.org")
+                   :token "token"
+                   :control (list :profile-digest digest)
+                   :agent-config (list :notify-to "friend@example.org"
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let* ((*fake-events* nil)
+             (response
+               (xmpp-cli/agent-daemon::handle-control-request
+                state
+                (list :token "token"
+                      :op :notify
+                      :route-id "route-1"
+                      :fallback-to "friend@example.org"
+                      :body "done"
+                      :expected-profile-digest digest))))
+        (check (getf response :ok)
+               "route notification should succeed")
+        (check-equal :room (getf response :target-kind))
+        (check-equal "room@groups.example.org" (getf response :target))
+        (check-equal '(:send-room-message "room@groups.example.org" "done")
+                     (first *fake-events*))))))
+
+(deftest daemon-notify-bound-room-falls-back-when-no-allowed-occupant-known
+  (with-isolated-data
+    (let* ((profile (test-profile))
+           (digest (xmpp-cli/agent-ipc:profile-digest profile))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :profile (list :jid "bot@example.org")
+                   :token "token"
+                   :control (list :profile-digest digest)
+                   :agent-config (list :notify-to "friend@example.org"
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (let* ((*fake-events* nil)
+             (response
+               (xmpp-cli/agent-daemon::handle-control-request
+                state
+                (list :token "token"
+                      :op :notify
+                      :route-id "route-1"
+                      :fallback-to "friend@example.org"
+                      :body "done"
+                      :expected-profile-digest digest))))
+        (check (getf response :ok)
+               "route notification should fall back to direct chat")
+        (check-equal :jid (getf response :target-kind))
+        (check-equal "friend@example.org" (getf response :target))
+        (check-equal "room@groups.example.org" (getf response :room))
+        (check-equal '(:send-connected-text "friend@example.org" "done")
+                     (first *fake-events*))))))
+
+(deftest daemon-notify-falls-back-to-direct-when-route-has-no-room
+  (with-isolated-data
+    (let* ((profile (test-profile))
+           (digest (xmpp-cli/agent-ipc:profile-digest profile))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :token "token"
+                   :control (list :profile-digest digest)
+                   :agent-config (list :notify-to "friend@example.org"))))
+      (let* ((*fake-events* nil)
+             (response
+               (xmpp-cli/agent-daemon::handle-control-request
+                state
+                (list :token "token"
+                      :op :notify
+                      :route-id "route-1"
+                      :fallback-to "friend@example.org"
+                      :body "done"
+                      :expected-profile-digest digest))))
+        (check (getf response :ok)
+               "route notification without room should use direct fallback")
+        (check-equal :jid (getf response :target-kind))
+        (check-equal "friend@example.org" (getf response :target))
+        (check-equal '(:send-connected-text "friend@example.org" "done")
+                     (first *fake-events*))))))
+
+(deftest room-ttl-expires-from-last-activity
+  (let* ((now (get-universal-time))
+         (old (xmpp-cli/util:now-iso8601 (- now (* 2 60 60))))
+         (room (list :room-jid "room@groups.example.org"
+                     :route-code "abcd"
+                     :route-id "route-1"
+                     :created-at old
+                     :last-activity-at old
+                     :state "active"))
+         (route (list :route-id "route-1"
+                      :code "abcd"))
+         (state (xmpp-cli/agent-daemon::make-daemon-state
+                 :agent-config (list :room-ttl-hours 1))))
+    (check (xmpp-cli/agent-rooms:room-expired-p room 1 now)
+           "room should expire when activity is older than room_ttl_hours")
+    (check (search "room_ttl_hours"
+                   (xmpp-cli/agent-daemon::stale-room-reason state
+                                                             route
+                                                             room))
+           "stale room reason should report room TTL expiry")))
+
+(deftest room-occupant-authorization-uses-real-jid
+  (let* ((state (xmpp-cli/agent-daemon::make-daemon-state
+                 :agent-config (list :allowed-senders
+                                     '("user@example.org"))))
+         (room (list :room-jid "room@groups.example.org"
+                     :room-nick "xmpp-cli"))
+         (presence (list :kind :presence
+                         :from "room@groups.example.org/larme"
+                         :room-jid "room@groups.example.org"
+                         :room-nick "larme"
+                         :muc-user-p t
+                         :muc-jid "user@example.org/phone"
+                         :muc-affiliation "member"
+                         :muc-role "participant"))
+         (message (list :kind :groupchat
+                        :from "room@groups.example.org/larme"
+                        :room-jid "room@groups.example.org"
+                        :room-nick "larme"
+                        :body "please test")))
+    (xmpp-cli/agent-daemon::remember-room-occupant state presence)
+    (check-equal "user@example.org"
+                 (xmpp-cli/agent-daemon::authorized-room-sender-p
+                  state
+                  room
+                  message))))
+
+(deftest room-occupants-clear-on-disconnect
+  (let* ((state (xmpp-cli/agent-daemon::make-daemon-state))
+         (presence (list :kind :presence
+                         :from "room@groups.example.org/larme"
+                         :room-jid "room@groups.example.org"
+                         :room-nick "larme"
+                         :muc-user-p t
+                         :muc-jid "user@example.org/phone")))
+    (xmpp-cli/agent-daemon::remember-room-occupant state presence)
+    (check (xmpp-cli/agent-daemon::room-occupant
+            state
+            "room@groups.example.org"
+            "larme")
+           "occupant should be cached before disconnect")
+    (xmpp-cli/agent-daemon::mark-disconnected state "closed")
+    (check (null (xmpp-cli/agent-daemon::room-occupant
+                  state
+                  "room@groups.example.org"
+                  "larme"))
+           "occupants should not survive reconnect boundaries")))
+
+(deftest room-route-activity-does-not-change-direct-default
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-a"
+                          :code "aaaa"
+                          :identity "route-a"
+                          :created-at older
+                          :last-seen-at older
+                          :last-used-at nil
+                          :last-direct-used-at nil))
+           (route-b (list :route-id "route-b"
+                          :code "bbbb"
+                          :identity "route-b"
+                          :created-at older
+                          :last-seen-at newer
+                          :last-used-at nil
+                          :last-direct-used-at nil)))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (xmpp-cli/agent-routes:mark-route-used
+       route-a
+       :now (xmpp-cli/util:now-iso8601 (+ (get-universal-time) 60))
+       :direct-p nil)
+      (check-equal "bbbb"
+                   (getf (xmpp-cli/agent-routes:last-active-route)
+                         :code))
+      (xmpp-cli/agent-routes:mark-route-used
+       route-a
+       :now (xmpp-cli/util:now-iso8601 (+ (get-universal-time) 120))
+       :direct-p t)
+      (check-equal "aaaa"
+                   (getf (xmpp-cli/agent-routes:last-active-route)
+                         :code)))))
+
+(deftest pending-iq-resolves-from-incoming-stanza
+  (let ((state (xmpp-cli/agent-daemon::make-daemon-state
+                :xmpp-status :connected
+                :connection :fake-connection))
+        (seen-id nil)
+        (thread nil))
+    (unwind-protect
+         (progn
+           (setf thread
+                 (bt:make-thread
+                  (lambda ()
+                    (loop until seen-id do (sleep 0.01))
+                    (sleep 0.05)
+                    (xmpp-cli/agent-daemon::handle-incoming-stanza
+                     state
+                     (list :kind :iq
+                           :id seen-id
+                           :type "result"
+                           :from "example.org")))
+                  :name "xmpp-cli test IQ resolver"))
+           (let ((response
+                   (xmpp-cli/agent-daemon::send-iq-and-wait
+                    state
+                    (lambda (connection id)
+                      (check-equal :fake-connection connection)
+                      (setf seen-id id))
+                    :timeout-seconds 2)))
+             (check-equal seen-id (getf response :id))
+             (check-equal 0
+                          (hash-table-count
+                           (xmpp-cli/agent-daemon::daemon-state-pending-iqs
+                            state)))))
+      (when (and thread (bt:thread-alive-p thread))
+        (ignore-errors
+          (bt:destroy-thread thread))))))
+
+(deftest pending-iq-timeout-removes-pending-entry
+  (let ((state (xmpp-cli/agent-daemon::make-daemon-state
+                :xmpp-status :connected
+                :connection :fake-connection)))
+    (check-signals-error
+      (xmpp-cli/agent-daemon::send-iq-and-wait
+       state
+       (lambda (connection id)
+         (declare (ignore connection id)))
+       :timeout-seconds 0.05))
+    (check-equal 0
+                 (hash-table-count
+                  (xmpp-cli/agent-daemon::daemon-state-pending-iqs state)))))
 
 (deftest json-parser-basic-object
   (let ((payload (xmpp-cli/json:parse-json
@@ -615,8 +1473,11 @@
               :tmux-context context
               :host "hbox"))
            (route-b (xmpp-cli/agent-codex:notification-route notification-b)))
-      (check-equal "friend@example.org"
-                   (xmpp-cli/agent-codex:notification-target notification-a))
+      (let ((target (xmpp-cli/agent-codex:notification-target notification-a)))
+        (check-equal :route (getf target :kind))
+        (check-equal (getf route-a :route-id) (getf target :route-id))
+        (check-equal code (getf target :route-code))
+        (check-equal "friend@example.org" (getf target :fallback-jid)))
       (check-equal 4 (length code))
       (check (every (lambda (char)
                       (and (char>= char #\a)
