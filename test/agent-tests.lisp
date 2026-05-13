@@ -1471,6 +1471,32 @@
     (check-equal "/dev/pts/45" (getf client :tmux-client-name))
     (check-equal "$6" (getf client :tmux-session-id))))
 
+(deftest tmux-paste-text-does-not-focus-pane
+  (with-isolated-data
+    (let ((old-focus (symbol-function 'xmpp-cli/tmux:focus-pane))
+          (old-run-tmux (symbol-function 'xmpp-cli/tmux::run-tmux))
+          (focus-count 0)
+          (commands nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'xmpp-cli/tmux:focus-pane)
+                   (lambda (route)
+                     (declare (ignore route))
+                     (incf focus-count)))
+             (setf (symbol-function 'xmpp-cli/tmux::run-tmux)
+                   (lambda (arguments &key socket)
+                     (push (list arguments socket) commands)
+                     ""))
+             (xmpp-cli/tmux:paste-text-and-enter
+              (list :code "abcd"
+                    :tmux-socket "/tmp/tmux-1000/default"
+                    :tmux-pane-id "%12")
+              "please run tests")
+             (check-equal 0 focus-count)
+             (check-equal 3 (length commands)))
+        (setf (symbol-function 'xmpp-cli/tmux:focus-pane) old-focus)
+        (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux)))))
+
 (deftest agent-reply-parser-is-case-insensitive
   (multiple-value-bind (code text)
       (xmpp-cli/agent-daemon:parse-agent-reply

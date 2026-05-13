@@ -330,7 +330,6 @@
    (agent-tmp-directory)))
 
 (defun paste-text-and-enter (route text)
-  (focus-pane route)
   (ensure-agent-tmp-directory)
   (let* ((code (getf route :code))
          (buffer-name (format nil "xmpp-agent-~a" (or code "route")))
