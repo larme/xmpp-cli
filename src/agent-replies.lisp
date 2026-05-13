@@ -184,6 +184,218 @@
         (find-route-by-code route-code routes ttl-days)
         (last-active-route routes))))
 
+(defparameter *direct-route-command-handlers*
+  (make-hash-table :test 'equal))
+
+(defparameter *room-route-command-handlers*
+  (make-hash-table :test 'equal))
+
+(defun route-command-reply (state context text)
+  (when (and text (plusp (length text)))
+    (ecase (getf context :scope)
+      (:direct
+       (send-daemon-note state (getf context :from) text))
+      (:room
+       (send-room-note state (getf context :room-jid) text)))))
+
+(defun route-command-arguments-valid-p (arguments min-args max-args)
+  (and (>= (length arguments) min-args)
+       (or (null max-args)
+           (<= (length arguments) max-args))))
+
+(defun route-command-usage (state context usage)
+  (route-command-reply state context
+                       (format nil "xmpp-cli: usage: ~a" usage)))
+
+(defun route-command-failure-target (route room)
+  (or (and route (getf route :code))
+      (and room (getf room :route-code))
+      "target"))
+
+(defun invoke-route-command (state route room arguments context function)
+  (handler-case
+      (route-command-reply
+       state
+       context
+       (funcall function state route room arguments context))
+    (error (condition)
+      (route-command-reply
+       state
+       context
+       (format nil "xmpp-cli: /~a failed for ~a: ~a"
+               (getf context :name)
+               (route-command-failure-target route room)
+               condition)))))
+
+(defun dispatch-direct-route-command (state
+                                      from
+                                      arguments
+                                      name
+                                      direct-route
+                                      target
+                                      min-args
+                                      max-args
+                                      usage
+                                      function)
+  (multiple-value-bind (route-code command-arguments default-route-p)
+      (ecase direct-route
+        (:optional
+         (values (first arguments) nil (null arguments)))
+        (:required
+         (values (first arguments) (rest arguments) nil)))
+    (let ((context (list :scope :direct
+                         :name name
+                         :from from
+                         :default-route-p default-route-p)))
+      (cond
+        ((and (eq direct-route :optional)
+              (> (length arguments) 1))
+         (route-command-usage state context usage))
+        ((and (eq direct-route :required) (null route-code))
+         (route-command-usage state context usage))
+        ((not (route-command-arguments-valid-p command-arguments
+                                               min-args
+                                               max-args))
+         (route-command-usage state context usage))
+        ((eq target :route)
+         (let ((route (resolve-command-route state route-code)))
+           (cond
+             ((null route)
+              (route-command-reply
+               state
+               context
+               (if route-code
+                   (format nil "xmpp-cli: unknown route code ~a" route-code)
+                   (format nil "xmpp-cli: no active route; wait for a Codex notification or pass ~a."
+                           usage))))
+             (t
+              (invoke-route-command
+               state route nil command-arguments context function)))))
+        ((eq target :room)
+         (let ((room (and route-code
+                          (find-active-room-by-route-code route-code))))
+           (cond
+             ((null room)
+              (route-command-reply
+               state
+               context
+               (format nil "xmpp-cli: no active room matched ~a"
+                       (or route-code "<missing>"))))
+             (t
+              (invoke-route-command
+               state
+               (route-for-room state room)
+               room
+               command-arguments
+               context
+               function)))))))))
+
+(defun dispatch-room-route-command (state
+                                    room
+                                    arguments
+                                    name
+                                    target
+                                    min-args
+                                    max-args
+                                    usage
+                                    function)
+  (let ((context (list :scope :room
+                       :name name
+                       :room room
+                       :room-jid (getf room :room-jid))))
+    (cond
+      ((not (route-command-arguments-valid-p arguments min-args max-args))
+       (route-command-usage state context usage))
+      ((eq target :route)
+       (let ((route (route-for-room state room)))
+         (cond
+           ((null route)
+            (route-command-reply
+             state
+             context
+             (format nil "xmpp-cli: route ~a is no longer active."
+                     (getf room :route-code))))
+           (t
+            (invoke-route-command
+             state route room arguments context function)))))
+      ((eq target :room)
+       (invoke-route-command
+        state
+        (route-for-room state room)
+        room
+        arguments
+        context
+        function)))))
+
+(defmacro define-route-command (name options &body body)
+  (let* ((base-name (string-downcase (symbol-name name)))
+         (room-name (or (getf options :room-name) base-name))
+         (direct-name-option (getf options :direct-name :same))
+         (direct-name (cond
+                        ((stringp direct-name-option)
+                         direct-name-option)
+                        ((eq direct-name-option :same)
+                         room-name)
+                        ((eq direct-name-option :room-prefixed)
+                         (concatenate 'string "room-" room-name))
+                        (t
+                         (error "Unknown direct command name option ~s."
+                                direct-name-option))))
+         (direct-route (getf options :direct-route :required))
+         (target (getf options :target :route))
+         (min-args (getf options :min-args 0))
+         (max-args (getf options :max-args 0))
+         (direct-usage (or (getf options :direct-usage)
+                           (format nil "/~a <route-code>" direct-name)))
+         (room-usage (or (getf options :room-usage)
+                         (format nil "/~a" room-name)))
+         (core-name (intern (format nil "%~a-ROUTE-COMMAND"
+                                    (string-upcase base-name))))
+         (direct-handler-name (intern (format nil "%~a-DIRECT-COMMAND"
+                                              (string-upcase base-name))))
+         (room-handler-name (intern (format nil "%~a-ROOM-COMMAND"
+                                            (string-upcase base-name)))))
+    (unless (member direct-route '(:required :optional))
+      (error "Unknown direct route policy ~s." direct-route))
+    (unless (member target '(:route :room))
+      (error "Unknown route command target ~s." target))
+    (when (and (eq direct-route :optional)
+               (or (plusp min-args)
+                   (and max-args (plusp max-args))))
+      (error "Optional direct route is only unambiguous for commands with no extra arguments."))
+    (when (and (eq target :room)
+               (eq direct-route :optional))
+      (error "Room-targeted direct commands need an explicit route code."))
+    `(progn
+       (defun ,core-name (state route room arguments context)
+         ,@body)
+       (defun ,direct-handler-name (state from arguments)
+         (dispatch-direct-route-command state
+                                        from
+                                        arguments
+                                        ,direct-name
+                                        ,direct-route
+                                        ,target
+                                        ,min-args
+                                        ,max-args
+                                        ,direct-usage
+                                        #',core-name))
+       (defun ,room-handler-name (state room arguments)
+         (dispatch-room-route-command state
+                                      room
+                                      arguments
+                                      ,room-name
+                                      ,target
+                                      ,min-args
+                                      ,max-args
+                                      ,room-usage
+                                      #',core-name))
+       (setf (gethash ,direct-name *direct-route-command-handlers*)
+             #',direct-handler-name)
+       (setf (gethash ,room-name *room-route-command-handlers*)
+             #',room-handler-name)
+       ',name)))
+
 (defun plist-string (plist key)
   (let ((value (getf plist key)))
     (and (stringp value)
@@ -593,6 +805,30 @@ into a room that only the bot has joined after reconnect."
    (getf room :room-jid)
    (format nil "xmpp-cli: sent feedback to ~a" (getf route :code))))
 
+(defun focus-route-for-command (route &key (direct-p t) room default-route-p)
+  (focus-pane route)
+  (mark-route-used route :direct-p direct-p)
+  (when room
+    (mark-room-activity room))
+  (format nil "xmpp-cli: focused ~a~a"
+          (getf route :code)
+          (if default-route-p " (default route)" "")))
+
+(define-route-command focus
+    (:direct-name :same
+     :room-name "focus"
+     :direct-route :optional
+     :target :route
+     :min-args 0
+     :max-args 0
+     :direct-usage "/focus [route-code]"
+     :room-usage "/focus")
+  (declare (ignore arguments))
+  (focus-route-for-command route
+                           :direct-p (eq (getf context :scope) :direct)
+                           :room room
+                           :default-route-p (getf context :default-route-p)))
+
 (defun room-close-result-message (room destroyed destroy-error)
   (if destroyed
       (format nil "xmpp-cli: closed room ~a"
@@ -602,46 +838,49 @@ into a room that only the bot has joined after reconnect."
               (getf room :room-jid)
               destroy-error)))
 
-(defun handle-room-local-close-command (state room arguments)
+(define-route-command close
+    (:direct-name :room-prefixed
+     :room-name "close"
+     :direct-route :required
+     :target :room
+     :min-args 0
+     :max-args 0
+     :direct-usage "/room-close <route-code>"
+     :room-usage "/close")
+  (declare (ignore route arguments))
   (let ((room-jid (getf room :room-jid)))
-    (cond
-      (arguments
-       (send-room-note state room-jid "xmpp-cli: usage: /close"))
-      (t
-       (send-room-note state room-jid
-                       (format nil "xmpp-cli: closing room ~a" room-jid))
-       (handler-case
-           (multiple-value-bind (destroyed destroy-error)
-               (close-room state
-                           room
-                           :reason "closed by xmpp-cli room user")
-             (declare (ignore destroyed))
-             (when destroy-error
-               (format *error-output*
-                       "~&xmpp-cli daemon: closed room ~a locally; server destroy was not acknowledged: ~a~%"
-                       room-jid
-                       destroy-error)
-               (finish-output *error-output*)))
-         (error (condition)
-           (send-room-note
-            state
-            room-jid
-            (format nil "xmpp-cli: /close failed for ~a: ~a"
-                    room-jid
-                    condition)))))))
-  t)
+    (when (eq (getf context :scope) :room)
+      (route-command-reply
+       state
+       context
+       (format nil "xmpp-cli: closing room ~a" room-jid)))
+    (multiple-value-bind (destroyed destroy-error)
+        (close-room state
+                    room
+                    :reason (if (eq (getf context :scope) :room)
+                                "closed by xmpp-cli room user"
+                                "closed by xmpp-cli user"))
+      (if (eq (getf context :scope) :direct)
+          (room-close-result-message room destroyed destroy-error)
+          (progn
+            (when destroy-error
+              (format *error-output*
+                      "~&xmpp-cli daemon: closed room ~a locally; server destroy was not acknowledged: ~a~%"
+                      room-jid
+                      destroy-error)
+              (finish-output *error-output*))
+            nil)))))
 
 (defun handle-room-local-command (state room body)
   (multiple-value-bind (name rest)
       (parse-agent-command body)
     (when name
-      (let ((room-jid (getf room :room-jid)))
+      (let ((room-jid (getf room :room-jid))
+            (handler (gethash name *room-route-command-handlers*)))
         (cond
-          ((string= name "close")
-           (handle-room-local-close-command
-            state
-            room
-            (split-command-arguments rest)))
+          (handler
+           (funcall handler state room (split-command-arguments rest))
+           t)
           ((string-prefix-p "room-" name)
            (send-room-note
             state
@@ -823,61 +1062,27 @@ into a room that only the bot has joined after reconnect."
              (format nil "xmpp-cli rooms:~%~{~a~%~}" lines)
              "xmpp-cli: no active rooms")))))
 
-(defun find-room-for-close (target)
-  (or (find-active-room-by-jid target)
-      (find-active-room-by-route-code target)))
-
-(defun handle-room-close-command (state from arguments)
-  (cond
-    ((/= (length arguments) 1)
-     (send-daemon-note state from
-                       "xmpp-cli: usage: /room-close <room-jid-or-route-code>"))
-    (t
-     (let* ((target (first arguments))
-            (room (find-room-for-close target)))
-         (cond
-           ((null room)
-            (send-daemon-note
-             state
-             from
-             (format nil "xmpp-cli: no active room matched ~a" target)))
-         (t
-          (handler-case
-              (multiple-value-bind (destroyed destroy-error)
-                  (close-room state
-                              room
-                              :reason "closed by xmpp-cli user")
-                (send-daemon-note
-                 state
-                 from
-                 (room-close-result-message room destroyed destroy-error)))
-            (error (condition)
-              (send-daemon-note
-               state
-               from
-               (format nil "xmpp-cli: /room-close failed for ~a: ~a"
-                       (getf room :room-jid)
-                       condition))))))))))
-
 (defun handle-direct-command (state from body)
   (multiple-value-bind (name rest)
       (parse-agent-command body)
-    (cond
-      ((null name)
-       nil)
-      ((string= name "new")
-       (handle-new-command state from (split-command-arguments rest)))
-      ((string= name "room")
-       (handle-room-command state from rest))
-      ((string= name "rooms")
-       (handle-rooms-command state from (split-command-arguments rest)))
-      ((string= name "room-close")
-       (handle-room-close-command state from (split-command-arguments rest)))
-      (t
-       (send-daemon-note
-        state
-        from
-        (format nil "xmpp-cli: unknown command /~a" name))))))
+    (let ((handler (and name
+                        (gethash name *direct-route-command-handlers*))))
+      (cond
+        ((null name)
+         nil)
+        (handler
+         (funcall handler state from (split-command-arguments rest)))
+        ((string= name "new")
+         (handle-new-command state from (split-command-arguments rest)))
+        ((string= name "room")
+         (handle-room-command state from rest))
+        ((string= name "rooms")
+         (handle-rooms-command state from (split-command-arguments rest)))
+        (t
+         (send-daemon-note
+          state
+          from
+          (format nil "xmpp-cli: unknown command /~a" name)))))))
 
 (defun log-message-error (message)
   (let ((from (getf message :from))

@@ -180,18 +180,19 @@ When replying from XMPP, prefix a route code to target a specific Codex pane.
 If the message does not start with an active route code, the daemon sends it to
 the most recently active route.
 
-Messages beginning with `/` are treated as commands. `/new [route-code]`
-starts a fresh Codex session in a new tmux window, using the same working
-directory and tmux session as the selected route. When `route-code` is omitted,
-the most recently active route is used. The daemon reply includes the new route
-code for the fresh window.
+Messages beginning with `/` are treated as commands. `/focus [route-code]`
+focuses the tmux pane for the selected route. `/new [route-code]` starts a
+fresh Codex session in a new tmux window, using the same working directory and
+tmux session as the selected route. When `route-code` is omitted, the most
+recently active route is used. The daemon reply includes the new route code for
+the fresh window.
 
 Room commands use XEP-0045 MUC rooms for route-specific feedback:
 
 ```text
 /room <route-code> [room-name]
 /rooms
-/room-close <room-jid-or-route-code>
+/room-close <route-code>
 ```
 
 `/room` always requires an explicit route code. It creates a temporary private
@@ -199,7 +200,8 @@ room, binds it to that route, invites the command sender, and replies with the
 room JID plus `xmpp:...?...join` URI. Messages sent inside the room are routed
 to the bound tmux pane without changing the direct-chat default route. Inside a
 room, room-local commands omit the `room-` prefix, so `/room-close ...` in a
-direct chat becomes `/close` in the room itself.
+direct chat becomes `/close` in the room itself. `/focus` also works inside a
+room and focuses the pane bound to that room.
 
 ## Tests
 

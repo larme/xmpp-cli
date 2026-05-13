@@ -42,6 +42,33 @@ XMPP transport should be checked in the delivered `build/xmpp-cli` image.
   instead of testing only through XMPP. For example, `xmpp-cli agent focus
   <code>` exercises the same tmux focus path as an XMPP bare-code reply.
 
+## Agent Command Conventions
+
+- Use `define-route-command` for daemon XMPP commands that should exist in both
+  direct chat and room chat. Keep the command body as normal Lisp code; the
+  macro should only own command registration, route or room target resolution,
+  usage text, and direct-vs-room reply routing.
+
+- Room chat commands get their route context from the room binding. Direct chat
+  commands parse the route code from the first argument unless the command has
+  no additional positional arguments and explicitly uses `:direct-route
+  :optional`.
+
+- If a command accepts positional arguments beyond the route code, keep
+  `:direct-route :required` so direct chat stays unambiguous:
+  `/cmd <route-code> arg1...`. The route code is always the first direct-chat
+  argument.
+
+- Use `:direct-name :same` when direct and room command names match, such as
+  `/focus`. Use `:direct-name :room-prefixed` when the direct command should be
+  namespaced while the room command is local, such as direct `/room-close
+  <route-code>` versus room `/close`.
+
+- Choose `:target :route` for commands operating on a tmux route and
+  `:target :room` for commands operating on the room bound to a route. Room
+  lifecycle commands should not require the underlying tmux route to still be
+  live unless that is part of the command's behavior.
+
 ## Verification Checklist
 
 Before calling a LispWorks-sensitive change done:

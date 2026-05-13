@@ -562,6 +562,20 @@
 (defvar *slow-room-join-lock*
   (bt:make-lock "xmpp-cli slow room test"))
 
+(defmacro with-fake-focus-pane ((focused-routes) &body body)
+  (let ((old-focus (gensym "OLD-FOCUS-")))
+    `(let ((,old-focus (symbol-function 'xmpp-cli/tmux:focus-pane))
+           (,focused-routes nil))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'xmpp-cli/tmux:focus-pane)
+                    (lambda (route)
+                      (push route ,focused-routes)
+                      :focused))
+              ,@body)
+         (setf (symbol-function 'xmpp-cli/tmux:focus-pane)
+               ,old-focus)))))
+
 (deftest room-state-round-trips-yaml
   (with-isolated-data
     (let ((room (list :room-jid "xmppcli-abcd-room-test@groups.example.org"
@@ -601,11 +615,13 @@
                       :state "active")))
       (xmpp-cli/agent-rooms:save-rooms (list room))
       (check-equal "room@groups.example.org"
-                   (getf (xmpp-cli/agent-daemon::find-room-for-close "ABCD")
+                   (getf (xmpp-cli/agent-rooms:find-active-room-by-route-code
+                          "ABCD")
                          :room-jid))
       (xmpp-cli/agent-rooms:mark-room-closed room
                                              "2026-05-12T00:05:00+08:00")
-      (check (null (xmpp-cli/agent-daemon::find-room-for-close "abcd"))
+      (check (null (xmpp-cli/agent-rooms:find-active-room-by-route-code
+                    "abcd"))
              "closed rooms should not match /room-close lookup")
       (check-equal '("room@groups.example.org route=abcd state=closed last=2026-05-12T00:00:00+08:00")
                    (xmpp-cli/agent-rooms:room-summary-lines
@@ -702,6 +718,41 @@
                      *fake-events*)
                "room /close should leave the current room")))))
 
+(deftest direct-room-close-command-closes-room-by-route-code
+  (with-isolated-data
+    (let* ((room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (let ((*fake-events* nil)
+            (*room-test-state* state)
+            (*fake-destroy-room-replies-p* t))
+        (xmpp-cli/agent-daemon::handle-direct-command
+         state
+         "friend@example.org"
+         "/room-close ABCD")
+        (check-equal "closed"
+                     (getf (first (xmpp-cli/agent-rooms:load-rooms))
+                           :state))
+        (check (some (lambda (event)
+                       (eq (first event) :destroy-room))
+                     *fake-events*)
+               "direct /room-close should try to destroy the room")
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-connected-text)
+                            (search "closed room" (third event))))
+                     *fake-events*)
+               "direct /room-close should acknowledge in direct chat")))))
+
 (deftest room-prefixed-direct-command-is-not-routed-inside-room
   (with-isolated-data
     (let* ((room (list :room-jid "room@groups.example.org"
@@ -744,6 +795,62 @@
                             (eq (first event) :destroy-room))
                           *fake-events*))
                "prefixed direct command should not close a room from inside the room")))))
+
+(deftest room-local-focus-command-focuses-bound-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-focus-pane (focused-routes)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-room-message
+           state
+           (list :kind :groupchat
+                 :from "room@groups.example.org/friend"
+                 :room-jid "room@groups.example.org"
+                 :room-nick "friend"
+                 :body "/focus"))
+          (check-equal "abcd" (getf (first focused-routes) :code))
+          (check (some (lambda (event)
+                         (and (eq (first event) :send-room-message)
+                              (search "focused abcd" (third event))))
+                       *fake-events*)
+                 "room /focus should acknowledge in the room")
+          (let ((updated (xmpp-cli/agent-routes:find-route-by-code "abcd")))
+            (check (getf updated :last-used-at)
+                   "room /focus should update route activity")
+            (check (null (getf updated :last-direct-used-at))
+                   "room /focus should not update direct-chat activity")))))))
 
 (deftest room-state-keeps-one-active-room-per-route
   (with-isolated-data
@@ -1483,6 +1590,52 @@
                           state
                           nil)
                          :code)))))
+
+(deftest agent-focus-command-resolves-explicit-and-default-route
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-a"
+                          :code "aaaa"
+                          :identity "route-a"
+                          :created-at older
+                          :last-seen-at older
+                          :last-used-at nil
+                          :last-direct-used-at nil))
+           (route-b (list :route-id "route-b"
+                          :code "bbbb"
+                          :identity "route-b"
+                          :created-at older
+                          :last-seen-at newer
+                          :last-used-at nil
+                          :last-direct-used-at nil))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (with-fake-focus-pane (focused-routes)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-direct-command
+           state
+           "friend@example.org"
+           "/focus")
+          (check-equal "bbbb" (getf (first focused-routes) :code))
+          (check (search "focused bbbb (default route)"
+                         (third (first *fake-events*)))
+                 "direct /focus should use the direct default route")
+          (xmpp-cli/agent-daemon::handle-direct-command
+           state
+           "friend@example.org"
+           "/focus AAAA")
+          (check-equal "aaaa" (getf (first focused-routes) :code))
+          (check (search "focused aaaa"
+                         (third (first *fake-events*)))
+                 "direct /focus should accept an explicit route code")
+          (let ((updated (xmpp-cli/agent-routes:find-route-by-code "aaaa")))
+            (check (getf updated :last-direct-used-at)
+                   "direct /focus should update direct-chat activity")))))))
 
 (deftest agent-new-command-allocates-route-for-new-window
   (with-isolated-data
