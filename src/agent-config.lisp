@@ -14,7 +14,6 @@
         :muc-discovery t
         :muc-discovery-cache-hours 24
         :room-nick "xmpp-cli"
-        :room-ttl-hours 24
         :room-public nil
         :room-persistent nil
         :room-members-only t
@@ -118,7 +117,6 @@
      "muc_discovery_cache_hours"
      validate-positive-integer)
     (:room-nick "room_nick" validate-non-empty-string)
-    (:room-ttl-hours "room_ttl_hours" validate-positive-integer)
     (:room-public "room_public" validate-boolean :boolean)
     (:room-persistent "room_persistent" validate-boolean :boolean)
     (:room-members-only "room_members_only" validate-boolean :boolean)

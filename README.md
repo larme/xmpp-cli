@@ -228,6 +228,11 @@ direct chat becomes `/close` in the room itself. `/focus` also works inside a
 room and focuses the pane bound to that room. `/choose <number>` works inside a
 room for pending prompt options on the room's bound route.
 
+Rooms are destroyed only by `/close` or `/room-close <route-code>`. If the
+bound route or tmux pane is gone, the room remains open and replies that the
+route is no longer active. Closing a room writes a local transcript under the
+agent room log directory and includes that path in the close acknowledgement.
+
 ## Tests
 
 The test system covers JID parsing, config round trips, history metadata, CLI validation, and CLI send behavior through a fake backend.

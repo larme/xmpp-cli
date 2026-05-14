@@ -35,7 +35,11 @@
           (call-with-xmpp-write-lock
            state
            (lambda ()
-             (send-room-message backend connection room-jid text))))
+             (send-room-message backend connection room-jid text)))
+          (ignore-errors
+            (let ((room (find-room-by-jid room-jid)))
+              (when room
+                (append-room-log-entry room "out" "xmpp-cli" text)))))
       (error (condition)
         (format *error-output*
                 "~&xmpp-cli daemon: could not send room note to ~a: ~a~%"
@@ -921,14 +925,21 @@ into a room that only the bot has joined after reconnect."
                            :room room
                            :default-route-p (getf context :default-route-p)))
 
-(defun room-close-result-message (room destroyed destroy-error)
-  (if destroyed
-      (format nil "xmpp-cli: closed room ~a"
-              (getf room :room-jid))
-      (format nil
-              "xmpp-cli: closed room ~a locally; server destroy was not acknowledged: ~a"
-              (getf room :room-jid)
-              destroy-error)))
+(defun room-log-display-path (room)
+  (display-path (namestring (room-log-pathname room))))
+
+(defun room-close-result-message (room destroyed destroy-error log-error)
+  (let ((base (if destroyed
+                  (format nil "xmpp-cli: closed room ~a"
+                          (getf room :room-jid))
+                  (format nil
+                          "xmpp-cli: closed room ~a locally; server destroy was not acknowledged: ~a"
+                          (getf room :room-jid)
+                          destroy-error))))
+    (format nil "~a~%log: ~a~@[~%log error: ~a~]"
+            base
+            (room-log-display-path room)
+            log-error)))
 
 (define-route-command close
     (:direct-name :room-prefixed
@@ -945,21 +956,30 @@ into a room that only the bot has joined after reconnect."
       (route-command-reply
        state
        context
-       (format nil "xmpp-cli: closing room ~a" room-jid)))
-    (multiple-value-bind (destroyed destroy-error)
+       (format nil "xmpp-cli: closing room ~a~%log: ~a"
+               room-jid
+               (room-log-display-path room))))
+    (multiple-value-bind (destroyed destroy-error log-path log-error)
         (close-room state
                     room
                     :reason (if (eq (getf context :scope) :room)
                                 "closed by xmpp-cli room user"
                                 "closed by xmpp-cli user"))
+      (declare (ignore log-path))
       (if (eq (getf context :scope) :direct)
-          (room-close-result-message room destroyed destroy-error)
+          (room-close-result-message room destroyed destroy-error log-error)
           (progn
             (when destroy-error
               (format *error-output*
                       "~&xmpp-cli daemon: closed room ~a locally; server destroy was not acknowledged: ~a~%"
                       room-jid
-                      destroy-error)
+              destroy-error)
+              (finish-output *error-output*))
+            (when log-error
+              (format *error-output*
+                      "~&xmpp-cli daemon: could not finalize room log for ~a: ~a~%"
+                      room-jid
+                      log-error)
               (finish-output *error-output*))
             nil)))))
 
@@ -988,6 +1008,43 @@ into a room that only the bot has joined after reconnect."
             (format nil "xmpp-cli: unknown room command /~a" name))
            t))))))
 
+(defun pane-active-p (route)
+  (handler-case
+      (pane-exists-p route)
+    (error ()
+      nil)))
+
+(defun send-room-inactive-route-note (state room)
+  (send-room-note
+   state
+   (getf room :room-jid)
+   (format nil "route ~a is no longer active"
+           (getf room :route-code))))
+
+(defun handle-room-route-text (state room body sender)
+  (let ((route (route-for-room state room)))
+    (cond
+      ((null route)
+       (send-room-inactive-route-note state room))
+      ((not (pane-active-p route))
+       (send-room-inactive-route-note state room))
+      (t
+       (handler-case
+           (handle-room-route-success state room route body sender)
+         (error (condition)
+           (send-room-note
+            state
+            (getf room :room-jid)
+            (format nil "xmpp-cli: route ~a failed: ~a"
+                    (getf room :route-code)
+                    condition))))))))
+
+(defun handle-authorized-room-message (state room body sender)
+  (ignore-errors
+    (append-room-log-entry room "in" sender body))
+  (or (handle-room-local-command state room body)
+      (handle-room-route-text state room body sender)))
+
 (defun handle-room-message (state stanza)
   (let* ((body (reply-text (getf stanza :body)))
          (room-jid (getf stanza :room-jid)))
@@ -1000,37 +1057,12 @@ into a room that only the bot has joined after reconnect."
            nil)
           (t
            (let ((sender (authorized-room-sender-p state room stanza)))
-             (cond
-               ((null sender)
-                (send-room-note
-                 state
-                 (getf room :room-jid)
-                 "xmpp-cli: ignored message because the room sender could not be verified as an allowed JID."))
-               ((handle-room-local-command state room body)
-                t)
-               (t
-                (let ((route (route-for-room state room)))
-                  (cond
-                    ((null route)
-                     (send-room-note
-                      state
-                      (getf room :room-jid)
-                      (format nil "xmpp-cli: route ~a is no longer active."
-                              (getf room :route-code))))
-                    (t
-                     (handler-case
-                         (handle-room-route-success state
-                                                    room
-                                                    route
-                                                    body
-                                                    sender)
-                       (error (condition)
-                         (send-room-note
-                          state
-                          (getf room :room-jid)
-                          (format nil "xmpp-cli: route ~a failed: ~a"
-                                  (getf room :route-code)
-                                  condition))))))))))))))))
+             (if sender
+                 (handle-authorized-room-message state room body sender)
+                 (send-room-note
+                  state
+                  (getf room :room-jid)
+                  "xmpp-cli: ignored message because the room sender could not be verified as an allowed JID.")))))))))
 
 (defun room-full-jid-for-room (state room)
   (room-full-jid (getf room :room-jid)
@@ -1052,7 +1084,9 @@ into a room that only the bot has joined after reconnect."
 
 (defun close-room (state room &key reason (mark-on-destroy-failure t))
   (let ((room-full (room-full-jid-for-room state room))
-        (destroy-error nil))
+        (destroy-error nil)
+        (log-path nil)
+        (log-error nil))
     (handler-case
         (destroy-room-and-wait state room :reason reason)
       (error (condition)
@@ -1064,7 +1098,12 @@ into a room that only the bot has joined after reconnect."
        (mark-room-closed room))
       (t
        (error destroy-error)))
-    (values (null destroy-error) destroy-error)))
+    (handler-case
+        (setf log-path
+              (finalize-room-log room :reason reason))
+      (error (condition)
+        (setf log-error condition)))
+    (values (null destroy-error) destroy-error log-path log-error)))
 
 (defun rejoin-room (state room)
   (let* ((room-jid (getf room :room-jid))
@@ -1107,45 +1146,6 @@ into a room that only the bot has joined after reconnect."
    (lambda ()
      (rejoin-active-rooms state))
    :name "xmpp-cli room rejoin"))
-
-(defun stale-room-reason (state route room)
-  (cond
-    ((null route)
-     (format nil "route ~a expired or no longer exists"
-             (getf room :route-code)))
-    ((room-expired-p room
-                     (getf (daemon-state-agent-config state)
-                           :room-ttl-hours))
-     (format nil "room exceeded room_ttl_hours (~d)"
-             (getf (daemon-state-agent-config state)
-                   :room-ttl-hours)))
-    ((not (pane-exists-p route))
-     (format nil "route ~a tmux pane no longer exists"
-             (getf room :route-code)))
-    (t nil)))
-
-(defun cleanup-stale-rooms (state)
-  (let* ((routes (active-routes-for-state state))
-         (closed 0))
-    (dolist (room (active-rooms) closed)
-      (let* ((route (find-route-by-id routes (getf room :route-id)))
-             (reason (stale-room-reason state route room)))
-        (when reason
-          (handler-case
-              (progn
-                (close-room state room
-                            :reason reason
-                            :mark-on-destroy-failure nil)
-                (incf closed)
-                (format *error-output*
-                        "~&xmpp-cli daemon: closed room ~a: ~a~%"
-                        (getf room :room-jid)
-                        reason))
-            (error (condition)
-              (format *error-output*
-                      "~&xmpp-cli daemon: could not close stale room ~a: ~a~%"
-                      (getf room :room-jid)
-                      condition))))))))
 
 (defun handle-rooms-command (state from arguments)
   (if arguments

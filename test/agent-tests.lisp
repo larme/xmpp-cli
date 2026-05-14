@@ -672,7 +672,11 @@
           (check (some (lambda (event)
                          (eq (first event) :leave-room))
                        *fake-events*)
-                 "close should leave the MUC even if destroy is not acknowledged"))))))
+                 "close should leave the MUC even if destroy is not acknowledged")
+          (let ((log (xmpp-cli/util:read-file-as-string
+                      (xmpp-cli/agent-rooms:room-log-pathname room))))
+            (check (search "room closed: test close" log)
+                   "close should finalize a room log")))))))
 
 (deftest room-local-close-command-closes-current-room
   (with-isolated-data
@@ -723,7 +727,13 @@
         (check (some (lambda (event)
                        (eq (first event) :leave-room))
                      *fake-events*)
-               "room /close should leave the current room")))))
+               "room /close should leave the current room")
+        (let ((log (xmpp-cli/util:read-file-as-string
+                    (xmpp-cli/agent-rooms:room-log-pathname room))))
+          (check (search "/close" log)
+                 "room log should include the user close command")
+          (check (search "room closed: closed by xmpp-cli room user" log)
+                 "room log should include the close event"))))))
 
 (deftest direct-room-close-command-closes-room-by-route-code
   (with-isolated-data
@@ -758,7 +768,12 @@
                        (and (eq (first event) :send-connected-text)
                             (search "closed room" (third event))))
                      *fake-events*)
-               "direct /room-close should acknowledge in direct chat")))))
+               "direct /room-close should acknowledge in direct chat")
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-connected-text)
+                            (search "log:" (third event))))
+                     *fake-events*)
+               "direct /room-close should include the log path")))))
 
 (deftest room-prefixed-direct-command-is-not-routed-inside-room
   (with-isolated-data
@@ -1586,26 +1601,119 @@
           (ignore-errors
             (bt:destroy-thread thread)))))))
 
-(deftest room-ttl-expires-from-last-activity
-  (let* ((now (get-universal-time))
-         (old (xmpp-cli/util:now-iso8601 (- now (* 2 60 60))))
-         (room (list :room-jid "room@groups.example.org"
-                     :route-code "abcd"
-                     :route-id "route-1"
-                     :created-at old
-                     :last-activity-at old
-                     :state "active"))
-         (route (list :route-id "route-1"
-                      :code "abcd"))
-         (state (xmpp-cli/agent-daemon::make-daemon-state
-                 :agent-config (list :room-ttl-hours 1))))
-    (check (xmpp-cli/agent-rooms:room-expired-p room 1 now)
-           "room should expire when activity is older than room_ttl_hours")
-    (check (search "room_ttl_hours"
-                   (xmpp-cli/agent-daemon::stale-room-reason state
-                                                             route
-                                                             room))
-           "stale room reason should report room TTL expiry")))
+(deftest room-missing-route-stays-open-and-replies-in-room
+  (with-isolated-data
+    (let* ((room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "missing-route"
+                       :route-code "abcd"
+                       :created-at "2026-05-12T00:00:00+08:00"
+                       :last-activity-at "2026-05-12T00:00:00+08:00"
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "room@groups.example.org/friend"
+               :room-jid "room@groups.example.org"
+               :room-nick "friend"
+               :body "hello"))
+        (check-equal "active"
+                     (getf (first (xmpp-cli/agent-rooms:load-rooms))
+                           :state))
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-room-message)
+                            (search "route abcd is no longer active"
+                                    (third event))))
+                     *fake-events*)
+               "room should get a clear inactive route reply")
+        (check (not (some (lambda (event)
+                            (eq (first event) :destroy-room))
+                          *fake-events*))
+               "missing routes should not auto-destroy rooms")))))
+
+(deftest room-missing-pane-stays-open-and-replies-in-room
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil
+                        :tmux-pane-id "%1"))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (old-pane-exists (symbol-function 'xmpp-cli/tmux:pane-exists-p)))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (unwind-protect
+           (let ((*fake-events* nil))
+             (setf (symbol-function 'xmpp-cli/tmux:pane-exists-p)
+                   (lambda (route)
+                     (declare (ignore route))
+                     nil))
+             (xmpp-cli/agent-daemon::handle-room-message
+              state
+              (list :kind :groupchat
+                    :from "room@groups.example.org/friend"
+                    :room-jid "room@groups.example.org"
+                    :room-nick "friend"
+                    :body "hello"))
+             (check-equal "active"
+                          (getf (first (xmpp-cli/agent-rooms:load-rooms))
+                                :state))
+             (check (some (lambda (event)
+                            (and (eq (first event) :send-room-message)
+                                 (search "route abcd is no longer active"
+                                         (third event))))
+                          *fake-events*)
+                    "room should get a clear inactive pane reply")
+             (check (not (some (lambda (event)
+                                 (eq (first event) :destroy-room))
+                               *fake-events*))
+                    "missing panes should not auto-destroy rooms"))
+        (setf (symbol-function 'xmpp-cli/tmux:pane-exists-p)
+              old-pane-exists)))))
 
 (deftest room-occupant-authorization-uses-real-jid
   (let* ((state (xmpp-cli/agent-daemon::make-daemon-state

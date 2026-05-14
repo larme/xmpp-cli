@@ -11,6 +11,9 @@
 (defun rooms-lock-pathname ()
   (merge-pathnames "rooms.lock" (agent-directory)))
 
+(defun room-logs-directory ()
+  (merge-pathnames "room-logs/" (agent-directory)))
+
 (defun call-with-rooms-lock (thunk)
   (ensure-agent-directory)
   (call-with-file-lock (rooms-lock-pathname)
@@ -60,16 +63,71 @@
                                '(:last-activity-at :created-at)))))
     (and times (reduce #'max times))))
 
-(defun room-expired-p (room ttl-hours &optional (now (get-universal-time)))
-  (and ttl-hours
-       (let ((activity-time (room-activity-time room)))
-         (or (null activity-time)
-             (> (- now activity-time)
-                (* ttl-hours 60 60))))))
-
 (defun room-bare-jid (jid)
   (let ((slash (and jid (position #\/ jid))))
     (if slash (subseq jid 0 slash) jid)))
+
+(defun safe-room-log-character (char)
+  (if (or (alphanumericp char)
+          (member char '(#\@ #\. #\- #\_) :test #'char=))
+      char
+      #\-))
+
+(defun safe-room-log-name (jid)
+  (with-output-to-string (out nil :element-type 'character)
+    (loop for char across (or jid "room")
+          do (write-char (safe-room-log-character char) out))
+    (write-string ".log" out)))
+
+(defun room-log-pathname (room-or-jid)
+  (let ((jid (if (stringp room-or-jid)
+                 room-or-jid
+                 (getf room-or-jid :room-jid))))
+    (merge-pathnames (safe-room-log-name (room-bare-jid jid))
+                     (room-logs-directory))))
+
+(defun ensure-room-logs-directory ()
+  (ensure-agent-directory)
+  (ensure-directories-exist (room-logs-directory))
+  (chmod-best-effort (room-logs-directory) "700"))
+
+(defun write-room-log-header (stream room)
+  (format stream
+          "# xmpp-cli room log~%# room: ~a~%# route: ~a~%# created_at: ~a~%~%"
+          (getf room :room-jid)
+          (or (getf room :route-code) "")
+          (or (getf room :created-at) "")))
+
+(defun append-room-log-entry (room direction sender body
+                              &optional (timestamp (now-iso8601)))
+  (ensure-room-logs-directory)
+  (let* ((pathname (room-log-pathname room))
+         (new-log-p (not (probe-file pathname))))
+    (with-open-file (out pathname
+                         :direction :output
+                         :if-exists :append
+                         :if-does-not-exist :create
+                         :element-type 'character
+                         :external-format :utf-8)
+      (when new-log-p
+        (write-room-log-header out room))
+      (format out
+              "---~%time: ~a~%direction: ~a~%sender: ~a~%body:~%~a~%"
+              timestamp
+              direction
+              (or sender "")
+              (or body "")))
+    (chmod-best-effort pathname "600")
+    pathname))
+
+(defun finalize-room-log (room &key reason actor)
+  (append-room-log-entry
+   room
+   "system"
+   (or actor "xmpp-cli")
+   (if (and reason (plusp (length reason)))
+       (format nil "room closed: ~a" reason)
+       "room closed")))
 
 (defun room-nick (jid)
   (let ((slash (and jid (position #\/ jid))))

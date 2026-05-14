@@ -105,6 +105,8 @@
                   (progn
                     (ignore-errors
                       (mark-room-activity room))
+                    (ignore-errors
+                      (append-room-log-entry room "out" "xmpp-cli" body))
                     (list :ok t
                           :target-kind :room
                           :target room-jid

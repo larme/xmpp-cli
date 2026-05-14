@@ -97,30 +97,17 @@
       (ignore-errors
         (bt:destroy-thread thread)))))
 
-(defun cleanup-daemon (state server xmpp-thread room-cleanup-thread token lock-acquired)
+(defun cleanup-daemon (state server xmpp-thread token lock-acquired)
   (when state
     (ignore-errors
       (request-stop state)))
   (when server
     (ignore-errors
       (usocket:socket-close server)))
-  (stop-worker-thread room-cleanup-thread "room cleanup")
   (stop-worker-thread xmpp-thread "XMPP")
   (delete-control token)
   (when lock-acquired
     (release-daemon-lock token)))
-
-(defun room-cleanup-loop (state)
-  (loop until (state-stopped-p state)
-        do (progn
-             (handler-case
-                 (cleanup-stale-rooms state)
-               (error (condition)
-                 (format *error-output*
-                         "~&xmpp-cli daemon: room cleanup failed: ~a~%"
-                         condition)
-                 (finish-output *error-output*)))
-             (sleep-until-stop state 300))))
 
 (defun run-daemon (backend)
   (let* ((agent-config (load-agent-config))
@@ -131,8 +118,7 @@
          (lock-acquired nil)
          (server nil)
          (state nil)
-         (xmpp-thread nil)
-         (room-cleanup-thread nil))
+         (xmpp-thread nil))
     (unless profile-plist
       (error "No auth/profile data found for profile ~a. Run xmpp-cli login first."
              profile-name))
@@ -158,14 +144,11 @@
                                             :server-socket server
                                             :token token))
              (save-control control)
-             (setf xmpp-thread
-                   (bt:make-thread (lambda () (xmpp-loop state))
-                                   :name "xmpp-cli XMPP daemon"))
-             (setf room-cleanup-thread
-                   (bt:make-thread (lambda () (room-cleanup-loop state))
-                                   :name "xmpp-cli room cleanup"))
-             (format t "xmpp-cli agent daemon listening on 127.0.0.1:~d using profile ~a~%"
-                     (getf control :port)
+               (setf xmpp-thread
+                     (bt:make-thread (lambda () (xmpp-loop state))
+                                     :name "xmpp-cli XMPP daemon"))
+               (format t "xmpp-cli agent daemon listening on 127.0.0.1:~d using profile ~a~%"
+                       (getf control :port)
                      profile-name)
              (finish-output)
              (accept-control-loop state)
@@ -173,6 +156,5 @@
       (cleanup-daemon state
                       server
                       xmpp-thread
-                      room-cleanup-thread
                       token
                       lock-acquired))))

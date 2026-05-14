@@ -2,6 +2,7 @@
   (:use #:cl)
   (:export
    #:home-xmpp-cli-directory
+   #:chmod-best-effort
    #:ensure-private-directory
    #:write-private-file
    #:read-file-as-string
@@ -276,6 +277,7 @@
 (defpackage #:xmpp-cli/agent-rooms
   (:use #:cl)
   (:import-from #:xmpp-cli/util
+                #:chmod-best-effort
                 #:now-iso8601
                 #:parse-iso8601)
   (:import-from #:xmpp-cli/agent-config
@@ -300,10 +302,12 @@
    #:find-active-room-by-jid
    #:find-active-room-by-route-code
    #:find-active-room-by-route-id
-   #:room-expired-p
    #:upsert-room
    #:mark-room-activity
    #:mark-room-closed
+   #:room-log-pathname
+   #:append-room-log-entry
+   #:finalize-room-log
    #:room-bare-jid
    #:room-nick
    #:room-full-jid
@@ -404,13 +408,16 @@
   (:import-from #:xmpp-cli/agent-rooms
                 #:load-rooms
                 #:active-rooms
+                #:find-room-by-jid
                 #:find-active-room-by-jid
                 #:find-active-room-by-route-code
                 #:find-active-room-by-route-id
-                #:room-expired-p
                 #:upsert-room
                 #:mark-room-activity
                 #:mark-room-closed
+                #:room-log-pathname
+                #:append-room-log-entry
+                #:finalize-room-log
                 #:room-bare-jid
                 #:room-nick
                 #:room-full-jid
