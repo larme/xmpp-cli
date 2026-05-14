@@ -18,6 +18,8 @@
   (pending-iqs (make-hash-table :test 'equal))
   (pending-iq-counter 0)
   (pending-room-joins (make-hash-table :test 'equal))
+  (pending-permissions (make-hash-table :test 'equal))
+  (pending-permission-counter 0)
   (room-occupants (make-hash-table :test 'equal)))
 
 (defstruct pending-request
@@ -25,6 +27,20 @@
   response
   error-text
   (condition (bt:make-condition-variable :name "xmpp-cli pending request")))
+
+(defstruct pending-permission
+  id
+  route-id
+  route-code
+  fallback-to
+  target-kind
+  target
+  room-jid
+  created-at
+  expires-at
+  response
+  error-text
+  (condition (bt:make-condition-variable :name "xmpp-cli pending permission")))
 
 (defparameter *reply-whitespace* '(#\Space #\Tab #\Newline #\Return))
 (defparameter *daemon-thread-stop-wait-seconds* 5)
@@ -54,6 +70,19 @@
 (defun fail-pending-room-joins-locked (state error-text)
   (fail-pending-table-locked state #'daemon-state-pending-room-joins error-text))
 
+(defun notify-pending-permission (pending)
+  (ignore-errors
+    (bt:condition-notify (pending-permission-condition pending))))
+
+(defun fail-pending-permissions-locked (state error-text)
+  (let ((table (daemon-state-pending-permissions state)))
+    (maphash (lambda (id pending)
+               (declare (ignore id))
+               (setf (pending-permission-error-text pending) error-text)
+               (notify-pending-permission pending))
+             table)
+    (clrhash table)))
+
 (defun state-stopped-p (state)
   (bt:with-lock-held ((daemon-state-lock state))
     (daemon-state-stop-p state)))
@@ -78,7 +107,8 @@
       (setf connection (daemon-state-connection state))
       (setf server (daemon-state-server-socket state))
       (fail-pending-iqs-locked state "XMPP daemon is stopping.")
-      (fail-pending-room-joins-locked state "XMPP daemon is stopping."))
+      (fail-pending-room-joins-locked state "XMPP daemon is stopping.")
+      (fail-pending-permissions-locked state "XMPP daemon is stopping."))
     (when server
       (wake-control-server server)
       (ignore-errors
@@ -110,7 +140,8 @@
     (setf (daemon-state-last-error state) error-text)
     (clrhash (daemon-state-room-occupants state))
     (fail-pending-iqs-locked state (or error-text "XMPP connection closed."))
-    (fail-pending-room-joins-locked state (or error-text "XMPP connection closed."))))
+    (fail-pending-room-joins-locked state (or error-text "XMPP connection closed."))
+    (fail-pending-permissions-locked state (or error-text "XMPP connection closed."))))
 
 (defun route-ttl-days (state)
   (getf (daemon-state-agent-config state) :route-ttl-days))
@@ -139,8 +170,113 @@
             (setf (daemon-state-connection state) nil)
             (fail-pending-iqs-locked state text)
             (when fail-room-joins-p
-              (fail-pending-room-joins-locked state text)))
+              (fail-pending-room-joins-locked state text))
+            (fail-pending-permissions-locked state text))
           (values nil text))))))
+
+(defun next-permission-id (state)
+  (bt:with-lock-held ((daemon-state-lock state))
+    (incf (daemon-state-pending-permission-counter state))
+    (format nil "permission-~36r-~36r"
+            (get-universal-time)
+            (daemon-state-pending-permission-counter state))))
+
+(defun permission-expired-p (pending &optional (now (get-universal-time)))
+  (let ((expires-at (pending-permission-expires-at pending)))
+    (and expires-at (>= now expires-at))))
+
+(defun prune-expired-permissions-locked (state)
+  (let ((now (get-universal-time))
+        (table (daemon-state-pending-permissions state))
+        (expired nil))
+    (maphash (lambda (id pending)
+               (when (permission-expired-p pending now)
+                 (push id expired)
+                 (setf (pending-permission-error-text pending)
+                       "Permission request expired.")
+                 (notify-pending-permission pending)))
+             table)
+    (dolist (id expired)
+      (remhash id table))))
+
+(defun register-pending-permission (state route timeout-seconds fallback-to)
+  (let* ((id (next-permission-id state))
+         (now (get-universal-time))
+         (pending (make-pending-permission
+                   :id id
+                   :route-id (getf route :route-id)
+                   :route-code (getf route :code)
+                   :fallback-to fallback-to
+                   :created-at now
+                   :expires-at (+ now timeout-seconds))))
+    (bt:with-lock-held ((daemon-state-lock state))
+      (setf (gethash id (daemon-state-pending-permissions state))
+            pending))
+    pending))
+
+(defun remove-pending-permission (state pending)
+  (bt:with-lock-held ((daemon-state-lock state))
+    (remhash (pending-permission-id pending)
+             (daemon-state-pending-permissions state))))
+
+(defun update-pending-permission-target (state pending response)
+  (bt:with-lock-held ((daemon-state-lock state))
+    (setf (pending-permission-target-kind pending)
+          (getf response :target-kind))
+    (setf (pending-permission-target pending)
+          (getf response :target))
+    (setf (pending-permission-room-jid pending)
+          (or (getf response :room)
+              (and (eq (getf response :target-kind) :room)
+                   (getf response :target))))))
+
+(defun answer-pending-permission (state pending decision &key message)
+  (bt:with-lock-held ((daemon-state-lock state))
+    (let ((current (gethash (pending-permission-id pending)
+                            (daemon-state-pending-permissions state))))
+      (when current
+        (setf (pending-permission-response current)
+              (list :decision decision :message message))
+        (remhash (pending-permission-id current)
+                 (daemon-state-pending-permissions state))
+        (notify-pending-permission current)
+        t))))
+
+(defun latest-pending-permission-for-route (state route-id)
+  (bt:with-lock-held ((daemon-state-lock state))
+    (prune-expired-permissions-locked state)
+    (let ((latest nil))
+      (maphash
+       (lambda (id pending)
+         (declare (ignore id))
+         (when (and (string= route-id
+                             (or (pending-permission-route-id pending) ""))
+                    (or (null latest)
+                        (> (pending-permission-created-at pending)
+                           (pending-permission-created-at latest))))
+           (setf latest pending)))
+       (daemon-state-pending-permissions state))
+      latest)))
+
+(defun wait-for-pending-permission (state pending timeout-seconds)
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout-seconds
+                               internal-time-units-per-second)))))
+    (bt:with-lock-held ((daemon-state-lock state))
+      (loop
+        (when (pending-permission-response pending)
+          (return (pending-permission-response pending)))
+        (when (pending-permission-error-text pending)
+          (error "~a" (pending-permission-error-text pending)))
+        (let ((remaining (/ (- deadline (get-internal-real-time))
+                            internal-time-units-per-second)))
+          (when (<= remaining 0)
+            (remhash (pending-permission-id pending)
+                     (daemon-state-pending-permissions state))
+            (error "Timed out waiting for XMPP permission reply."))
+          (bt:condition-wait (pending-permission-condition pending)
+                             (daemon-state-lock state)
+                             :timeout remaining))))))
 
 (defun daemon-send-text (state to body)
   (daemon-send-with-connection

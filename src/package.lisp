@@ -217,7 +217,10 @@
                 #:context-available-p)
   (:export
    #:read-codex-payload
+   #:codex-permission-request-p
+   #:codex-permission-decision-json
    #:build-codex-notification
+   #:notification-with-permission-replies
    #:notification-target
    #:notification-body
    #:notification-bodies
@@ -349,6 +352,7 @@
    #:request-control
    #:daemon-send
    #:daemon-notify
+   #:daemon-permission-request
    #:daemon-status
    #:daemon-stop
    #:wait-for-daemon-stop
@@ -512,7 +516,10 @@
                 #:remove-allowed-sender)
   (:import-from #:xmpp-cli/agent-codex
                 #:read-codex-payload
+                #:codex-permission-request-p
+                #:codex-permission-decision-json
                 #:build-codex-notification
+                #:notification-with-permission-replies
                 #:notification-target
                 #:notification-body
                 #:notification-bodies)
@@ -524,7 +531,9 @@
                 #:daemon-status
                 #:daemon-stop
                 #:wait-for-daemon-stop
-                #:daemon-discover-muc)
+                #:daemon-discover-muc
+                #:daemon-permission-request
+                #:profile-digest)
   (:import-from #:xmpp-cli/agent-muc
                 #:muc-service-result-summary)
   (:import-from #:xmpp-cli/sender

@@ -173,6 +173,86 @@
                            length)))
             finally (return (nreverse parts))))))
 
+(defun normalize-option-number-text (text)
+  (substitute #\Space #\, (reply-text text)))
+
+(defun option-number-token-p (token)
+  (and (stringp token)
+       (plusp (length token))
+       (every (lambda (char)
+                (and (char>= char #\0)
+                     (char<= char #\9)))
+              token)))
+
+(defun parse-option-numbers (text)
+  (let ((tokens (split-command-arguments
+                 (normalize-option-number-text text))))
+    (when (and tokens (every #'option-number-token-p tokens))
+      (mapcar (lambda (token)
+                (parse-integer token :junk-allowed nil))
+              tokens))))
+
+(defun permission-option-decision (numbers)
+  (cond
+    ((null numbers)
+     (values nil "no option number was provided"))
+    ((> (length numbers) 1)
+     (values nil "multiple permission options are not supported yet"))
+    ((= (first numbers) 1)
+     (values :allow "allow" 1))
+    ((= (first numbers) 2)
+     (values :deny "deny" 2))
+    (t
+     (values nil
+             (format nil "option ~d is not available"
+                     (first numbers))
+             (first numbers)))))
+
+(defun permission-deny-message (pending)
+  (format nil "Denied from XMPP reply for route ~a."
+          (pending-permission-route-code pending)))
+
+(defun permission-selection-ack (pending option-number label)
+  (format nil "xmpp-cli: selected option ~d for ~a: ~a"
+          option-number
+          (pending-permission-route-code pending)
+          label))
+
+(defun pending-permission-selection-message (state pending numbers)
+  (multiple-value-bind (decision label option-number)
+      (permission-option-decision numbers)
+    (cond
+      ((null decision)
+       (format nil "xmpp-cli: ~a for ~a"
+               label
+               (pending-permission-route-code pending)))
+      ((answer-pending-permission
+        state
+        pending
+        decision
+        :message (and (eq decision :deny)
+                      (permission-deny-message pending)))
+       (permission-selection-ack pending option-number label))
+      (t
+       (format nil "xmpp-cli: no pending prompt for ~a"
+               (pending-permission-route-code pending))))))
+
+(defun choose-permission-response (state route option-text)
+  (let ((numbers (parse-option-numbers option-text))
+        (route-code (getf route :code)))
+    (cond
+      ((null numbers)
+       (format nil "xmpp-cli: /choose expects a numeric option for ~a"
+               route-code))
+      (t
+       (let ((pending (latest-pending-permission-for-route
+                       state
+                       (getf route :route-id))))
+         (if pending
+             (pending-permission-selection-message state pending numbers)
+             (format nil "xmpp-cli: no pending prompt for ~a"
+                     route-code)))))))
+
 (defun string-prefix-p (prefix string)
   (and (<= (length prefix) (length string))
        (string= prefix string :end2 (length prefix))))
@@ -395,6 +475,18 @@
        (setf (gethash ,room-name *room-route-command-handlers*)
              #',room-handler-name)
        ',name)))
+
+(define-route-command choose
+    (:direct-name :same
+     :room-name "choose"
+     :direct-route :required
+     :target :route
+     :min-args 1
+     :max-args 1
+     :direct-usage "/choose <route-code> <number>"
+     :room-usage "/choose <number>")
+  (declare (ignore room context))
+  (choose-permission-response state route (first arguments)))
 
 (defun plist-string (plist key)
   (let ((value (getf plist key)))
@@ -927,7 +1019,11 @@ into a room that only the bot has joined after reconnect."
                               (getf room :route-code))))
                     (t
                      (handler-case
-                         (handle-room-route-success state room route body sender)
+                         (handle-room-route-success state
+                                                    room
+                                                    route
+                                                    body
+                                                    sender)
                        (error (condition)
                          (send-room-note
                           state

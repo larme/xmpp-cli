@@ -6,7 +6,9 @@
   target
   body
   bodies
-  route)
+  route
+  message-prefix-lines
+  message-detail)
 
 (defun read-codex-payload (&optional (stream *standard-input*))
   (let ((raw (read-stream-as-string stream)))
@@ -23,6 +25,10 @@
 
 (defun payload-value (payload key &optional default)
   (string-value (json-value payload key nil) default))
+
+(defun codex-permission-request-p (payload)
+  (string= (payload-value payload "hook_event_name" "")
+           "PermissionRequest"))
 
 (defun first-payload-value (payload keys &optional default)
   (dolist (key keys default)
@@ -228,6 +234,18 @@
   (when (string= event "PermissionRequest")
     (normalize-detail (payload-value payload "tool_name" ""))))
 
+(defun permission-reply-lines (route)
+  (let ((code (and route (getf route :code))))
+    (append
+     (list "reply options:")
+     (if (and code (plusp (length code)))
+         (list (format nil "allow: /choose ~a 1 (direct) or /choose 1 (room)"
+                       code)
+               (format nil "deny: /choose ~a 2 (direct) or /choose 2 (room)"
+                       code))
+         (list "allow: /choose 1"
+               "deny: /choose 2")))))
+
 (defun build-header (route host display-repo event &optional tool-name)
   (let ((header (format nil "~a ~a ~a ~a"
                         (or (getf route :code) "no-route")
@@ -238,7 +256,12 @@
         (format nil "~a tool=~a" header tool-name)
         header)))
 
-(defun notification-prefix-lines (payload route host display-repo display-cwd)
+(defun notification-prefix-lines (payload
+                                  route
+                                  host
+                                  display-repo
+                                  display-cwd
+                                  &key permission-replies-p)
   (let* ((event (payload-value payload "hook_event_name" "Codex"))
          (tool-name (permission-tool-name payload event))
          (lines (list* (build-header route
@@ -257,7 +280,9 @@
                (list (format nil "permission: ~a"
                              (payload-value payload
                                             "permission_mode"
-                                            "unknown")))))
+                                            "unknown")))
+               (when permission-replies-p
+                 (permission-reply-lines route))))
       (t
        lines))))
 
@@ -283,6 +308,25 @@
       (list :kind :jid
             :jid fallback-jid)))
 
+(defun make-notification-from-parts (target route prefix-lines detail)
+  (make-notification :target target
+                     :body (build-body prefix-lines detail)
+                     :bodies (split-notification-body prefix-lines detail)
+                     :route route
+                     :message-prefix-lines prefix-lines
+                     :message-detail detail))
+
+(defun notification-with-permission-replies (notification)
+  (let ((route (notification-route notification)))
+    (unless route
+      (error "Permission reply options require a route."))
+    (make-notification-from-parts
+     (notification-target notification)
+     route
+     (append (notification-message-prefix-lines notification)
+             (permission-reply-lines route))
+     (notification-message-detail notification))))
+
 (defun build-codex-notification (payload config &key tmux-context host cwd)
   (let* ((fallback-jid (notify-to config))
          (host (short-hostname host))
@@ -295,13 +339,30 @@
          (context (or tmux-context (capture-context)))
          (route (route-for-context context payload config host cwd display-cwd))
          (prefix-lines (notification-prefix-lines payload
-                                                  route
-                                                  host
-                                                  display-repo
-                                                  display-cwd))
+                                                 route
+                                                 host
+                                                 display-repo
+                                                 display-cwd))
          (detail (notification-detail payload))
-         (body (build-body prefix-lines detail)))
-    (make-notification :target (notification-target-for-route route fallback-jid)
-                       :body body
-                       :bodies (split-notification-body prefix-lines detail)
-                       :route route)))
+         (target (notification-target-for-route route fallback-jid)))
+    (make-notification-from-parts target route prefix-lines detail)))
+
+(defun permission-decision-name (decision)
+  (case decision
+    (:allow "allow")
+    (:deny "deny")
+    (t (error "Unknown Codex permission decision: ~s" decision))))
+
+(defun codex-permission-decision-json (decision &key message)
+  (let ((decision-object
+          (list (cons "behavior" (permission-decision-name decision)))))
+    (when (and (eq decision :deny)
+               message
+               (plusp (length message)))
+      (setf decision-object
+            (append decision-object
+                    (list (cons "message" message)))))
+    (json-compact-string
+     (list (cons "hookSpecificOutput"
+                 (list (cons "hookEventName" "PermissionRequest")
+                       (cons "decision" decision-object)))))))
