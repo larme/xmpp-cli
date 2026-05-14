@@ -38,6 +38,13 @@ XMPP transport should be checked in the delivered `build/xmpp-cli` image.
   keeps them because daemon control messages use a small local S-expression
   protocol.
 
+- Do not force `:keep-eval nil` for normal level-2 delivery. Some Quicklisp or
+  transport dependencies can leave interpreted callbacks in the image, and a
+  stripped evaluator later fails as `SYSTEM::*%APPLY-INTERPRETED-FUNCTION*`.
+  If experimenting with `DELIVERY_KEEP_EVAL=0`, keep
+  `:error-on-interpreted-functions t` so this fails during delivery instead of
+  daemon startup.
+
 - Prefer adding narrow diagnostic CLI commands for delivered-image smoke tests
   instead of testing only through XMPP. For example, `xmpp-cli agent focus
   <code>` exercises the same tmux focus path as an XMPP bare-code reply.

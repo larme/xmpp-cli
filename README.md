@@ -25,7 +25,7 @@ DELIVERY_LEVEL=0 ./scripts/build.sh   # largest, keeps delivered debug support b
 DELIVERY_LEVEL=3 ./scripts/build.sh   # smaller, needs runtime testing
 ```
 
-Set `DELIVERY_DEBUG=1` when you need LispWorks delivered-image debugger support at a higher delivery level, or `DELIVERY_DEBUG=0` to force it off for a level `0` build. The delivery script keeps LispWorks reader and pretty-printer support because the daemon IPC uses a small local S-expression protocol and XMPP error paths may print XML objects. Do not run `strip` on the delivered executable; it removes the LispWorks image trailer and corrupts the binary.
+Set `DELIVERY_DEBUG=1` when you need LispWorks delivered-image debugger support at a higher delivery level, or `DELIVERY_DEBUG=0` to force it off for a level `0` build. The delivery script keeps evaluator support by default below delivery level `4`, matching LispWorks' safer default for images that may retain interpreted callbacks from dependencies. Set `DELIVERY_KEEP_EVAL=0` only for aggressive size experiments; the build will fail if interpreted functions would remain. The script also keeps LispWorks reader and pretty-printer support because the daemon IPC uses a small local S-expression protocol and XMPP error paths may print XML objects. Do not run `strip` on the delivered executable; it removes the LispWorks image trailer and corrupts the binary.
 
 ## Usage
 

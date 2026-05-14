@@ -57,6 +57,12 @@
         (env-true-p "DELIVERY_DEBUG")
         (zerop level))))
 
+(defun delivery-keep-eval-p (level debug-p)
+  (let ((raw (uiop:getenv "DELIVERY_KEEP_EVAL")))
+    (if raw
+        (env-true-p "DELIVERY_KEEP_EVAL")
+        (or debug-p (< level 4)))))
+
 (defun delivery-output-pathname (root)
   (let ((raw (uiop:getenv "XMPP_CLI_DELIVERY_OUTPUT")))
     (if (and raw (plusp (length raw)))
@@ -82,10 +88,12 @@
   (let* ((entry-point (intern "ENTRY-POINT" "XMPP-CLI/MAIN"))
          (output (delivery-output-pathname root))
          (level (parse-delivery-level))
-         (debug-p (delivery-debug-p level)))
-    (format t "~&Delivering xmpp-cli at level ~d~@[ with delivery debug support~]...~%"
+         (debug-p (delivery-debug-p level))
+         (keep-eval-p (delivery-keep-eval-p level debug-p)))
+    (format t "~&Delivering xmpp-cli at level ~d~@[ with delivery debug support~]~@[ with evaluator support~]...~%"
             level
-            debug-p)
+            debug-p
+            keep-eval-p)
     (deliver entry-point
              output
              level
@@ -94,7 +102,8 @@
              :keep-stub-functions debug-p
              :keep-function-name (if debug-p t :minimal)
              :keep-conditions :all
-             :keep-eval debug-p
+             :keep-eval keep-eval-p
+             :error-on-interpreted-functions (not keep-eval-p)
              :keep-pretty-printer t
              :keep-lisp-reader t
              :keep-load-function (and debug-p :full)))
