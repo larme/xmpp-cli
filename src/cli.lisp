@@ -221,126 +221,6 @@
                        (format nil "xmpp-cli: ~?" control arguments)))))
   +exit-success+)
 
-(defun target-route-id (target)
-  (and (listp target)
-       (eq (getf target :kind) :route)
-       (getf target :route-id)))
-
-(defun target-direct-jid (target)
-  (cond
-    ((stringp target) target)
-    ((not (listp target)) nil)
-    ((eq (getf target :kind) :jid) (getf target :jid))
-    ((eq (getf target :kind) :route) (getf target :fallback-jid))
-    (t nil)))
-
-(defun permission-response-error-text (response error fallback)
-  (or (and (listp response) (getf response :error))
-      (and error (princ-to-string error))
-      fallback))
-
-(defun emit-codex-permission-decision (response)
-  (let ((decision (getf response :decision)))
-    (cond
-      ((member decision '(:allow :deny))
-       (format t "~a~%"
-               (codex-permission-decision-json
-                decision
-                :message (getf response :message)))
-       +exit-success+)
-      (t
-       (notify-codex-warning
-        "daemon returned an invalid permission decision: ~s"
-        decision)))))
-
-(defun send-permission-notification-without-decision (profile-name
-                                                      profile-plist
-                                                      target
-                                                      body
-                                                      bodies
-                                                      reason)
-  (multiple-value-bind (transport error)
-      (send-notification-parts-with-fallback profile-name
-                                             profile-plist
-                                             target
-                                             bodies)
-    (declare (ignore transport))
-    (if error
-        (progn
-          (ignore-errors
-            (append-send-history profile-name
-                                 (delivery-target-label target)
-                                 :codex-notification
-                                 body
-                                 :failed
-                                 :error (princ-to-string error)))
-          (notify-codex-warning
-           "permission request could not be bridged over XMPP (~a), and notification fallback failed: ~a"
-           reason
-           error))
-        (progn
-          (maybe-append-send-history profile-name
-                                     (delivery-target-label target)
-                                     :codex-notification
-                                     body
-                                     :sent)
-          (notify-codex-warning
-           "permission request notification sent, but XMPP approval replies are unavailable: ~a"
-           reason)))))
-
-(defun handle-codex-permission-notification (profile-name
-                                             profile-plist
-                                             notification)
-  (let* ((target (notification-target notification))
-         (body (notification-body notification))
-         (bodies (notification-bodies notification))
-         (route-id (target-route-id target))
-         (fallback-to (target-direct-jid target)))
-    (unless route-id
-      (return-from handle-codex-permission-notification
-        (send-permission-notification-without-decision
-         profile-name
-         profile-plist
-         target
-         body
-         bodies
-         "no tmux route was available")))
-    (let* ((actionable-notification
-             (notification-with-permission-replies notification))
-           (actionable-target (notification-target actionable-notification))
-           (actionable-body (notification-body actionable-notification))
-           (actionable-bodies (notification-bodies actionable-notification)))
-      (multiple-value-bind (ok response error)
-          (daemon-permission-request route-id
-                                     fallback-to
-                                     actionable-bodies
-                                     :expected-profile-digest
-                                     (profile-digest profile-plist))
-        (cond
-          (ok
-           (maybe-append-send-history profile-name
-                                      (delivery-target-label actionable-target)
-                                      :codex-notification
-                                      actionable-body
-                                      :sent)
-           (emit-codex-permission-decision response))
-          ((and (listp response) (getf response :sent))
-           (notify-codex-warning
-            "permission request was sent over XMPP, but no approval reply was received: ~a"
-            (permission-response-error-text response
-                                            error
-                                            "permission request failed")))
-          (t
-           (send-permission-notification-without-decision
-            profile-name
-            profile-plist
-            target
-            body
-            bodies
-            (permission-response-error-text response
-                                            error
-                                            "daemon is unavailable"))))))))
-
 (defun handle-agent-notify-codex (cmd)
   (declare (ignore cmd))
   (let* ((payload
@@ -376,11 +256,6 @@
              (body (notification-body notification))
              (bodies (notification-bodies notification))
              (send-error nil))
-        (when (codex-permission-request-p payload)
-          (return-from handle-agent-notify-codex
-            (handle-codex-permission-notification profile-name
-                                                  profile-plist
-                                                  notification)))
         (multiple-value-bind (transport error)
             (send-notification-parts-with-fallback profile-name
                                                    profile-plist

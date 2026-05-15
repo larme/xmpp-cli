@@ -73,7 +73,7 @@ statusMessage = "Sending XMPP completion notice"
 [[hooks.PermissionRequest.hooks]]
 type = "command"
 command = {json.dumps(command)}
-timeout = 420
+timeout = 20
 statusMessage = "Sending XMPP input notice"
 {end_marker}
 """.strip() + "\n"

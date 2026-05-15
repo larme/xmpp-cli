@@ -184,32 +184,20 @@ Notification headers include the route code, event, hostname, repository
 location, current working directory, and tool name when Codex is waiting for
 approval.
 
-For `PermissionRequest` events, the daemon can bridge approval back to Codex
-when the hook can identify a tmux route and register a pending approval. In
-that case, the XMPP prompt includes:
-
-```text
-allow: /choose <route-code> 1 (direct) or /choose 1 (room)
-deny: /choose <route-code> 2 (direct) or /choose 2 (room)
-```
-
-In direct chat, reply with `/choose <route-code> 1` or `/choose <route-code> 2`.
-In a route-bound room, reply with `/choose 1` or `/choose 2` in the room. The
-Codex hook waits for that reply and returns Codex's official allow/deny hook
-JSON. If the daemon is not running, no tmux route is available, or the approval
-times out, Codex falls back to its normal local approval UI.
+`PermissionRequest` events are delivered as normal XMPP notifications. Replying
+from XMPP sends text to the routed tmux pane, so Codex's normal local approval
+UI remains the source of truth.
 
 When replying from XMPP, prefix a route code to target a specific Codex pane.
 If the message does not start with an active route code, the daemon sends it to
 the most recently active route.
 
 Messages beginning with `/` are treated as commands. `/focus [route-code]`
-focuses the tmux pane for the selected route. `/choose <route-code> <number>`
-selects a pending prompt option. `/new [route-code]` starts a fresh Codex
-session in a new tmux window, using the same working directory and tmux session
-as the selected route. When `route-code` is omitted, the most recently active
-route is used. The daemon reply includes the new route code for the fresh
-window.
+focuses the tmux pane for the selected route. `/new [route-code]` starts a
+fresh Codex session in a new tmux window, using the same working directory and
+tmux session as the selected route. When `route-code` is omitted, the most
+recently active route is used. The daemon reply includes the new route code for
+the fresh window.
 
 Room commands use XEP-0045 MUC rooms for route-specific feedback:
 
@@ -225,13 +213,15 @@ room JID plus `xmpp:...?...join` URI. Messages sent inside the room are routed
 to the bound tmux pane without changing the direct-chat default route. Inside a
 room, room-local commands omit the `room-` prefix, so `/room-close ...` in a
 direct chat becomes `/close` in the room itself. `/focus` also works inside a
-room and focuses the pane bound to that room. `/choose <number>` works inside a
-room for pending prompt options on the room's bound route.
+room and focuses the pane bound to that room.
 
-Rooms are destroyed only by `/close` or `/room-close <route-code>`. If the
-bound route or tmux pane is gone, the room remains open and replies that the
-route is no longer active. Closing a room writes a local transcript under the
-agent room log directory and includes that path in the close acknowledgement.
+Rooms are closed locally only by `/close` or `/room-close <route-code>`. When a
+room is closed, `xmpp-cli` attempts to destroy the MUC room and leave it. If
+the server does not acknowledge the destroy request, `xmpp-cli` still marks the
+room closed locally and says so in the close acknowledgement. If the bound route
+or tmux pane is gone, the room remains open and replies that the route is no
+longer active. Closing a room writes a local transcript under the agent room
+log directory and includes that path in the close acknowledgement.
 
 ## Tests
 

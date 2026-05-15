@@ -2,7 +2,6 @@
 
 (defparameter *control-connect-timeout-seconds* 1)
 (defparameter *control-io-timeout-seconds* 10)
-(defparameter *permission-request-timeout-seconds* 300)
 (defparameter *max-ipc-frame-octets* (* 1024 1024))
 (defparameter *max-ipc-frame-length-line-chars* 20)
 (defparameter *daemon-stop-wait-seconds* 5)
@@ -313,33 +312,6 @@
        (values t response nil))
       (response
        (values nil response (daemon-response-error response "daemon notify failed")))
-      (t
-       (values nil nil error)))))
-
-(defun daemon-permission-request (route-id
-                                  fallback-to
-                                  bodies
-                                  &key
-                                    expected-profile-digest
-                                    (timeout-seconds
-                                     *permission-request-timeout-seconds*))
-  (multiple-value-bind (response error)
-      (request-control
-       (list :op :permission-request
-             :route-id route-id
-             :fallback-to fallback-to
-             :bodies bodies
-             :timeout-seconds timeout-seconds
-             :expected-profile-digest expected-profile-digest)
-       :timeout-seconds (+ timeout-seconds
-                           *control-io-timeout-seconds*))
-    (cond
-      ((and (listp response) (getf response :ok))
-       (values t response nil))
-      (response
-       (values nil response
-               (daemon-response-error response
-                                      "daemon permission request failed")))
       (t
        (values nil nil error)))))
 
