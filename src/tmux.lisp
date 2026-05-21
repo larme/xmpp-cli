@@ -349,6 +349,14 @@
       (ignore-errors
         (delete-file temp)))))
 
+(defun send-escape-key (route)
+  (let ((pane-id (getf route :tmux-pane-id)))
+    (unless pane-id
+      (error "Route does not include a tmux pane target."))
+    (run-tmux (list "send-keys" "-t" pane-id "Escape")
+              :socket (getf route :tmux-socket))
+    t))
+
 (defun route-session-id (route)
   (let ((session-id (getf route :tmux-session-id))
         (pane-id (getf route :tmux-pane-id))

@@ -196,6 +196,7 @@
 	   #:pane-exists-p
 	   #:focus-pane
    #:paste-text-and-enter
+   #:send-escape-key
    #:start-codex-session))
 
 (defpackage #:xmpp-cli/agent-codex
@@ -383,6 +384,7 @@
                 #:focus-pane
                 #:pane-exists-p
                 #:paste-text-and-enter
+                #:send-escape-key
                 #:start-codex-session)
   (:import-from #:xmpp-cli/backend
                 #:call-with-connection

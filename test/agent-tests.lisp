@@ -576,6 +576,20 @@
          (setf (symbol-function 'xmpp-cli/tmux:focus-pane)
                ,old-focus)))))
 
+(defmacro with-fake-send-escape-key ((cancelled-routes) &body body)
+  (let ((old-send-escape (gensym "OLD-SEND-ESCAPE-")))
+    `(let ((,old-send-escape (symbol-function 'xmpp-cli/tmux:send-escape-key))
+           (,cancelled-routes nil))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'xmpp-cli/tmux:send-escape-key)
+                    (lambda (route)
+                      (push route ,cancelled-routes)
+                      :cancelled))
+              ,@body)
+         (setf (symbol-function 'xmpp-cli/tmux:send-escape-key)
+               ,old-send-escape)))))
+
 (defun wait-for-test-condition (predicate &key (retries 50) (delay 0.02))
   (loop repeat retries
         when (funcall predicate)
@@ -873,6 +887,63 @@
                    "room /focus should update route activity")
             (check (null (getf updated :last-direct-used-at))
                    "room /focus should not update direct-chat activity")))))))
+
+(deftest room-local-cancel-command-sends-escape-to-bound-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil
+                        :tmux-pane-id "%12"))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-send-escape-key (cancelled-routes)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-room-message
+           state
+           (list :kind :groupchat
+                 :from "room@groups.example.org/friend"
+                 :room-jid "room@groups.example.org"
+                 :room-nick "friend"
+                 :body "/cancel"))
+          (check-equal "abcd" (getf (first cancelled-routes) :code))
+          (check (some (lambda (event)
+                         (and (eq (first event) :send-room-message)
+                              (search "sent Escape to abcd" (third event))))
+                       *fake-events*)
+                 "room /cancel should acknowledge in the room")
+          (let ((updated (xmpp-cli/agent-routes:find-route-by-code "abcd")))
+            (check (getf updated :last-used-at)
+                   "room /cancel should update route activity")
+            (check (null (getf updated :last-direct-used-at))
+                   "room /cancel should not update direct-chat activity")))))))
 
 (deftest room-state-keeps-one-active-room-per-route
   (with-isolated-data
@@ -1626,6 +1697,32 @@
         (setf (symbol-function 'xmpp-cli/tmux:focus-pane) old-focus)
         (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux)))))
 
+(deftest tmux-send-escape-does-not-focus-pane
+  (with-isolated-data
+    (let ((old-focus (symbol-function 'xmpp-cli/tmux:focus-pane))
+          (old-run-tmux (symbol-function 'xmpp-cli/tmux::run-tmux))
+          (focus-count 0)
+          (commands nil))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'xmpp-cli/tmux:focus-pane)
+                   (lambda (route)
+                     (declare (ignore route))
+                     (incf focus-count)))
+             (setf (symbol-function 'xmpp-cli/tmux::run-tmux)
+                   (lambda (arguments &key socket)
+                     (push (list arguments socket) commands)
+                     ""))
+             (xmpp-cli/tmux:send-escape-key
+              (list :tmux-socket "/tmp/tmux-1000/default"
+                    :tmux-pane-id "%12"))
+             (check-equal 0 focus-count)
+             (check-equal
+              '("send-keys" "-t" "%12" "Escape")
+              (first (first commands))))
+        (setf (symbol-function 'xmpp-cli/tmux:focus-pane) old-focus)
+        (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux)))))
+
 (deftest agent-reply-parser-is-case-insensitive
   (multiple-value-bind (code text)
       (xmpp-cli/agent-daemon:parse-agent-reply
@@ -1791,6 +1888,54 @@
           (let ((updated (xmpp-cli/agent-routes:find-route-by-code "aaaa")))
             (check (getf updated :last-direct-used-at)
                    "direct /focus should update direct-chat activity")))))))
+
+(deftest agent-cancel-command-resolves-explicit-and-default-route
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-a"
+                          :code "aaaa"
+                          :identity "route-a"
+                          :created-at older
+                          :last-seen-at older
+                          :last-used-at nil
+                          :last-direct-used-at nil
+                          :tmux-pane-id "%11"))
+           (route-b (list :route-id "route-b"
+                          :code "bbbb"
+                          :identity "route-b"
+                          :created-at older
+                          :last-seen-at newer
+                          :last-used-at nil
+                          :last-direct-used-at nil
+                          :tmux-pane-id "%12"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (with-fake-send-escape-key (cancelled-routes)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-direct-command
+           state
+           "friend@example.org"
+           "/cancel")
+          (check-equal "bbbb" (getf (first cancelled-routes) :code))
+          (check (search "sent Escape to bbbb (default route)"
+                         (third (first *fake-events*)))
+                 "direct /cancel should use the default route")
+          (xmpp-cli/agent-daemon::handle-direct-command
+           state
+           "friend@example.org"
+           "/cancel AAAA")
+          (check-equal "aaaa" (getf (first cancelled-routes) :code))
+          (check (search "sent Escape to aaaa"
+                         (third (first *fake-events*)))
+                 "direct /cancel should accept an explicit route code")
+          (let ((updated (xmpp-cli/agent-routes:find-route-by-code "aaaa")))
+            (check (getf updated :last-direct-used-at)
+                   "direct /cancel should update direct-chat activity")))))))
 
 (deftest agent-new-command-allocates-route-for-new-window
   (with-isolated-data

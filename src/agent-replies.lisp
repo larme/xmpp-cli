@@ -833,6 +833,30 @@ into a room that only the bot has joined after reconnect."
                            :room room
                            :default-route-p (getf context :default-route-p)))
 
+(defun cancel-route-for-command (route &key (direct-p t) room default-route-p)
+  (send-escape-key route)
+  (mark-route-used route :direct-p direct-p)
+  (when room
+    (mark-room-activity room))
+  (format nil "xmpp-cli: sent Escape to ~a~a"
+          (getf route :code)
+          (if default-route-p " (default route)" "")))
+
+(define-route-command cancel
+    (:direct-name :same
+     :room-name "cancel"
+     :direct-route :optional
+     :target :route
+     :min-args 0
+     :max-args 0
+     :direct-usage "/cancel [route-code]"
+     :room-usage "/cancel")
+  (declare (ignore arguments))
+  (cancel-route-for-command route
+                            :direct-p (eq (getf context :scope) :direct)
+                            :room room
+                            :default-route-p (getf context :default-route-p)))
+
 (defun room-log-display-path (room)
   (display-path (namestring (room-log-pathname room))))
 
