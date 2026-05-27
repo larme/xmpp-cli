@@ -153,10 +153,17 @@
           return code
         finally (error "Could not allocate a unique route code after many attempts.")))
 
+(defun route-metadata-value-present-p (value)
+  (not (or (null value)
+           (and (stringp value)
+                (zerop (length value))))))
+
 (defun update-route-metadata (route metadata now)
   (let ((updated (copy-list route)))
     (loop for (key value) on metadata by #'cddr
-          do (setf (getf updated key) value))
+          do (when (or (route-metadata-value-present-p value)
+                       (null (getf updated key)))
+               (setf (getf updated key) value)))
     (setf (getf updated :last-seen-at) now)
     (setf (getf updated :notify-count)
           (1+ (or (getf updated :notify-count) 0)))
@@ -172,6 +179,48 @@
                 :last-used-at nil
                 :last-direct-used-at nil
                 :notify-count 1)))
+
+(defun non-empty-route-string (value)
+  (and (stringp value)
+       (plusp (length value))
+       value))
+
+(defun route-value-compatible-p (left right &key (test #'string=))
+  (let ((left (non-empty-route-string left))
+        (right (non-empty-route-string right)))
+    (or (null left)
+        (null right)
+        (funcall test left right))))
+
+(defun route-agent-compatible-p (left right)
+  (let ((left (string-downcase (string (or left ""))))
+        (right (string-downcase (string (or right "")))))
+    (or (zerop (length left))
+        (zerop (length right))
+        (string= left right))))
+
+(defun same-tmux-target-route-p (route metadata)
+  (let ((route-pane (non-empty-route-string (getf route :tmux-pane-id)))
+        (metadata-pane (non-empty-route-string (getf metadata :tmux-pane-id))))
+    (and route-pane
+         metadata-pane
+         (string= route-pane metadata-pane)
+         (route-agent-compatible-p (getf route :agent)
+                                   (getf metadata :agent))
+         (route-value-compatible-p (getf route :host)
+                                   (getf metadata :host)
+                                   :test #'string-equal)
+         (route-value-compatible-p (getf route :tmux-socket)
+                                   (getf metadata :tmux-socket))
+         (route-value-compatible-p (getf route :tmux-session-id)
+                                   (getf metadata :tmux-session-id))
+         (route-value-compatible-p (getf route :tmux-window-id)
+                                   (getf metadata :tmux-window-id)))))
+
+(defun find-route-by-tmux-target (routes metadata)
+  (find-if (lambda (route)
+             (same-tmux-target-route-p route metadata))
+           routes))
 
 (defun ensure-route (identity &key
                                 (code-length 4)
@@ -205,6 +254,8 @@
                             :tmux-session-id tmux-session-id
                             :tmux-window-id tmux-window-id
                             :tmux-pane-id tmux-pane-id)))
+       (unless existing
+         (setf existing (find-route-by-tmux-target routes metadata)))
        (if existing
            (let* ((updated (update-route-metadata existing metadata now))
                   (new-routes (cons updated

@@ -1987,7 +1987,26 @@
                          :code))
       (check-equal new-code
                    (getf (xmpp-cli/agent-routes:last-active-route)
-                         :code)))))
+                         :code))
+      (let* ((payload (xmpp-cli/json:parse-json
+                       "{\"hook_event_name\":\"Stop\",\"model\":\"gpt-test\",\"turn_id\":\"turn-1\",\"session_id\":\"new-session\",\"cwd\":\"/home/larme/codes/cl-projects/xmpp-cli\",\"last_assistant_message\":\"done\"}"))
+             (notification
+               (xmpp-cli/agent-codex:build-codex-notification
+                payload
+                (list :notify-to "friend@example.org"
+                      :code-length 4
+                      :route-ttl-days 90)
+                :tmux-context new-context
+                :host "hbox"))
+             (notified-route
+               (xmpp-cli/agent-codex:notification-route notification))
+             (stored-route
+               (xmpp-cli/agent-routes:find-route-by-code new-code)))
+        (check-equal new-code (getf notified-route :code))
+        (check (= 2 (length (xmpp-cli/agent-routes:load-routes)))
+               "first notification from /new pane should not allocate a second route")
+        (check-equal "new-session" (getf stored-route :agent-session))
+        (check-equal "/dev/pts/45" (getf stored-route :tmux-client-name))))))
 
 (deftest codex-notification-allocates-route-code
   (with-isolated-data
