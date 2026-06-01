@@ -3,6 +3,9 @@
 (defparameter *code-alphabet* "abcdefghijklmnopqrstuvwxyz")
 (defparameter *routes-lock-stale-seconds* 30)
 (defparameter *routes-lock-wait-seconds* 10)
+(defparameter *current-route-state* "current")
+(defparameter *stale-route-state* "stale")
+(defparameter *superseded-route-state* "superseded")
 
 (defun routes-pathname ()
   (merge-pathnames "routes.yaml" (agent-directory)))
@@ -47,6 +50,23 @@
 
 (defun route-code-equal (left right)
   (and left right (string-equal left right)))
+
+(defun route-state (route)
+  (or (getf route :state) *current-route-state*))
+
+(defun route-state-p (route state)
+  (string-equal (route-state route) state))
+
+(defun route-superseded-p (route)
+  (route-state-p route *superseded-route-state*))
+
+(defun route-stale-p (route)
+  (route-state-p route *stale-route-state*))
+
+(defun route-lookup-active-p (route ttl-days &optional (now (get-universal-time)))
+  (and (not (route-superseded-p route))
+       (not (route-stale-p route))
+       (not (route-expired-p route ttl-days now))))
 
 (defun yaml-to-route (mapping)
   (unless (listp mapping)
@@ -94,7 +114,7 @@
 (defun last-active-route (&optional (routes (load-routes)))
   (let ((best nil)
         (best-time nil))
-    (dolist (route routes best)
+    (dolist (route (active-routes routes nil) best)
       (let ((time (or (route-direct-activity-time route) 0)))
         (when (or (null best) (> time best-time))
           (setf best route
@@ -108,19 +128,27 @@
                 (* ttl-days 24 60 60))))))
 
 (defun active-routes (routes ttl-days &optional (now (get-universal-time)))
-  (if ttl-days
-      (remove-if (lambda (route)
-                   (route-expired-p route ttl-days now))
-                 routes)
-      routes))
+  (remove-if-not (lambda (route)
+                   (route-lookup-active-p route ttl-days now))
+                 routes))
+
+(defun unexpired-routes (routes ttl-days &optional (now (get-universal-time)))
+  (remove-if (lambda (route)
+               (route-expired-p route ttl-days now))
+             routes))
+
+(defun load-unexpired-routes-from-disk (&key route-ttl-days)
+  (let* ((routes (load-routes-from-disk))
+         (unexpired (unexpired-routes routes route-ttl-days)))
+    (when (and route-ttl-days
+               (/= (length routes) (length unexpired)))
+      (save-routes-to-disk unexpired))
+    unexpired))
 
 (defun load-active-routes-from-disk (&key route-ttl-days)
-  (let* ((routes (load-routes-from-disk))
-         (active (active-routes routes route-ttl-days)))
-    (when (and route-ttl-days
-               (/= (length routes) (length active)))
-      (save-routes-to-disk active))
-    active))
+  (active-routes (load-unexpired-routes-from-disk
+                  :route-ttl-days route-ttl-days)
+                 route-ttl-days))
 
 (defun load-active-routes (&key route-ttl-days)
   (call-with-routes-lock
@@ -132,11 +160,10 @@
                                                (getf route :route-id))))
 
 (defun find-route-by-code (code &optional (routes (load-routes)) route-ttl-days)
-  (let ((route (find code routes :test #'route-code-equal :key (lambda (entry)
-                                                                 (getf entry :code)))))
-    (and route
-         (not (route-expired-p route route-ttl-days))
-         route)))
+  (find-if (lambda (route)
+             (and (route-code-equal code (getf route :code))
+                  (route-lookup-active-p route route-ttl-days)))
+           routes))
 
 (defun find-active-route-by-code (code route-ttl-days)
   (find-route-by-code code
@@ -144,7 +171,8 @@
                       route-ttl-days))
 
 (defun used-code-p (code routes)
-  (find-route-by-code code routes))
+  (find code routes :test #'route-code-equal :key (lambda (entry)
+                                                    (getf entry :code))))
 
 (defun allocate-route-code (routes code-length)
   (loop repeat 10000
@@ -164,6 +192,11 @@
           do (when (or (route-metadata-value-present-p value)
                        (null (getf updated key)))
                (setf (getf updated key) value)))
+    (setf (getf updated :state) *current-route-state*)
+    (remf updated :stale-at)
+    (remf updated :stale-reason)
+    (remf updated :superseded-at)
+    (remf updated :superseded-by-route-id)
     (setf (getf updated :last-seen-at) now)
     (setf (getf updated :notify-count)
           (1+ (or (getf updated :notify-count) 0)))
@@ -178,6 +211,7 @@
                 :last-seen-at now
                 :last-used-at nil
                 :last-direct-used-at nil
+                :state *current-route-state*
                 :notify-count 1)))
 
 (defun non-empty-route-string (value)
@@ -222,6 +256,34 @@
              (same-tmux-target-route-p route metadata))
            routes))
 
+(defun route-agent-session-compatible-p (route agent agent-session)
+  (and (non-empty-route-string agent-session)
+       (route-agent-compatible-p (getf route :agent) agent)
+       (string= agent-session
+                (or (getf route :agent-session) ""))))
+
+(defun supersede-route-entry (route superseded-by-route-id now)
+  (let ((updated (copy-list route)))
+    (setf (getf updated :state) *superseded-route-state*)
+    (setf (getf updated :superseded-at) now)
+    (setf (getf updated :superseded-by-route-id) superseded-by-route-id)
+    updated))
+
+(defun supersede-other-routes-for-session (routes current-route agent agent-session now)
+  (if (non-empty-route-string agent-session)
+      (let ((current-route-id (getf current-route :route-id)))
+        (mapcar (lambda (route)
+                  (if (and (not (string= current-route-id
+                                          (or (getf route :route-id) "")))
+                           (not (route-superseded-p route))
+                           (route-agent-session-compatible-p route
+                                                             agent
+                                                             agent-session))
+                      (supersede-route-entry route current-route-id now)
+                      route))
+                routes))
+      routes))
+
 (defun ensure-route (identity &key
                                 (code-length 4)
                                 route-ttl-days
@@ -238,7 +300,7 @@
                                 tmux-pane-id)
   (call-with-routes-lock
    (lambda ()
-     (let* ((routes (load-active-routes-from-disk
+     (let* ((routes (load-unexpired-routes-from-disk
                      :route-ttl-days route-ttl-days))
             (route-id (route-id-for-identity identity))
             (existing (find-route-by-id routes route-id))
@@ -258,13 +320,26 @@
          (setf existing (find-route-by-tmux-target routes metadata)))
        (if existing
            (let* ((updated (update-route-metadata existing metadata now))
-                  (new-routes (cons updated
-                                    (remove existing routes :test #'eq))))
+                  (routes-with-updated
+                    (cons updated
+                          (remove existing routes :test #'eq)))
+                  (new-routes
+                    (supersede-other-routes-for-session routes-with-updated
+                                                        updated
+                                                        agent
+                                                        agent-session
+                                                        now)))
              (save-routes-to-disk new-routes)
              (values updated new-routes nil))
            (let* ((code (allocate-route-code routes code-length))
                   (route (make-route route-id code identity metadata now))
-                  (new-routes (cons route routes)))
+                  (routes-with-new (cons route routes))
+                  (new-routes
+                    (supersede-other-routes-for-session routes-with-new
+                                                        route
+                                                        agent
+                                                        agent-session
+                                                        now)))
              (save-routes-to-disk new-routes)
              (values route new-routes t)))))))
 
@@ -276,11 +351,50 @@
             (existing (and route-id (find-route-by-id routes route-id))))
        (unless existing
          (error "Route no longer exists for code ~a." (getf route :code)))
+       (unless (route-lookup-active-p existing nil)
+         (error "Route ~a is no longer active." (getf route :code)))
          (let* ((updated (copy-list existing))
                 (new-routes nil))
            (setf (getf updated :last-used-at) now)
            (when direct-p
              (setf (getf updated :last-direct-used-at) now))
            (setf new-routes (cons updated (remove existing routes :test #'eq)))
+         (save-routes-to-disk new-routes)
+         updated)))))
+
+(defun mark-route-stale (route reason &key (now (now-iso8601)))
+  (call-with-routes-lock
+   (lambda ()
+     (let* ((routes (load-routes-from-disk))
+            (route-id (getf route :route-id))
+            (existing (and route-id (find-route-by-id routes route-id))))
+       (unless existing
+         (error "Route no longer exists for code ~a." (getf route :code)))
+       (when (route-superseded-p existing)
+         (error "Route ~a has been superseded." (getf route :code)))
+       (let* ((updated (copy-list existing))
+              (new-routes nil))
+         (setf (getf updated :state) *stale-route-state*)
+         (setf (getf updated :stale-at) now)
+         (setf (getf updated :stale-reason) reason)
+         (setf new-routes (cons updated (remove existing routes :test #'eq)))
+         (save-routes-to-disk new-routes)
+         updated)))))
+
+(defun mark-route-superseded (route superseded-by-route
+                              &key (now (now-iso8601)))
+  (call-with-routes-lock
+   (lambda ()
+     (let* ((routes (load-routes-from-disk))
+            (route-id (getf route :route-id))
+            (existing (and route-id (find-route-by-id routes route-id))))
+       (unless existing
+         (error "Route no longer exists for code ~a." (getf route :code)))
+       (let* ((updated (supersede-route-entry
+                        existing
+                        (getf superseded-by-route :route-id)
+                        now))
+              (new-routes (cons updated
+                                (remove existing routes :test #'eq))))
          (save-routes-to-disk new-routes)
          updated)))))

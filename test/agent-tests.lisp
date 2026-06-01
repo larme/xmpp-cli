@@ -77,6 +77,68 @@
       (check-equal code (getf matched :code))
       (check-equal 2 (getf route-b :notify-count)))))
 
+(deftest route-creation-supersedes-older-route-for-codex-session
+  (with-isolated-data
+    (let* ((identity-a (xmpp-cli/agent-routes:canonical-route-identity
+                        :host "hbox"
+                        :tmux-socket "/tmp/tmux-1000/default"
+                        :tmux-session-id "$1"
+                        :tmux-window-id "@3"
+                        :tmux-pane-id "%12"
+                        :agent :codex
+                        :agent-session "session-1"))
+           (route-a (xmpp-cli/agent-routes:ensure-route
+                     identity-a
+                     :agent :codex
+                     :agent-session "session-1"
+                     :host "hbox"
+                     :cwd "/repo"
+                     :display-cwd "~/repo"
+                     :tmux-socket "/tmp/tmux-1000/default"
+                     :tmux-session-id "$1"
+                     :tmux-window-id "@3"
+                     :tmux-pane-id "%12"))
+           (identity-b (xmpp-cli/agent-routes:canonical-route-identity
+                        :host "hbox"
+                        :tmux-socket "/tmp/tmux-1000/default"
+                        :tmux-session-id "$1"
+                        :tmux-window-id "@4"
+                        :tmux-pane-id "%13"
+                        :agent :codex
+                        :agent-session "session-1"))
+           (route-b (xmpp-cli/agent-routes:ensure-route
+                     identity-b
+                     :agent :codex
+                     :agent-session "session-1"
+                     :host "hbox"
+                     :cwd "/repo"
+                     :display-cwd "~/repo"
+                     :tmux-socket "/tmp/tmux-1000/default"
+                     :tmux-session-id "$1"
+                     :tmux-window-id "@4"
+                     :tmux-pane-id "%13"))
+           (routes (xmpp-cli/agent-routes:load-routes))
+           (stored-a (xmpp-cli/agent-routes:find-route-by-id
+                      routes
+                      (getf route-a :route-id)))
+           (stored-b (xmpp-cli/agent-routes:find-route-by-id
+                      routes
+                      (getf route-b :route-id))))
+      (check (not (string= (getf route-a :code)
+                           (getf route-b :code)))
+             "new route should not reuse the older route code")
+      (check (null (xmpp-cli/agent-routes:find-route-by-code
+                    (getf route-a :code)))
+             "superseded route code should not resolve")
+      (check-equal (getf route-b :code)
+                   (getf (xmpp-cli/agent-routes:find-route-by-code
+                          (getf route-b :code))
+                         :code))
+      (check-equal "superseded" (getf stored-a :state))
+      (check-equal (getf route-b :route-id)
+                   (getf stored-a :superseded-by-route-id))
+      (check-equal "current" (getf stored-b :state)))))
+
 (deftest route-ttl-prunes-expired-routes
   (with-isolated-data
     (let* ((now (get-universal-time))
@@ -590,6 +652,42 @@
          (setf (symbol-function 'xmpp-cli/tmux:send-escape-key)
                ,old-send-escape)))))
 
+(defmacro with-fake-codex-pane-active-p ((active-routes active-p) &body body)
+  (let ((old-active (gensym "OLD-ACTIVE-")))
+    `(let ((,old-active (symbol-function 'xmpp-cli/tmux:codex-pane-active-p))
+           (,active-routes nil))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'xmpp-cli/tmux:codex-pane-active-p)
+                    (lambda (route)
+                      (push route ,active-routes)
+                      ,active-p))
+              ,@body)
+         (setf (symbol-function 'xmpp-cli/tmux:codex-pane-active-p)
+               ,old-active)))))
+
+(defmacro with-fake-start-codex-session ((calls result-context) &body body)
+  (let ((old-start (gensym "OLD-START-")))
+    `(let ((,old-start (symbol-function 'xmpp-cli/tmux:start-codex-session))
+           (,calls nil))
+       (unwind-protect
+            (progn
+              (setf (symbol-function 'xmpp-cli/tmux:start-codex-session)
+                    (lambda (route &key
+                                     resume-session-id
+                                     focus-source-p
+                                     prefer-existing-window-p)
+                      (push (list :route route
+                                  :resume-session-id resume-session-id
+                                  :focus-source-p focus-source-p
+                                  :prefer-existing-window-p
+                                  prefer-existing-window-p)
+                            ,calls)
+                      ,result-context))
+              ,@body)
+         (setf (symbol-function 'xmpp-cli/tmux:start-codex-session)
+               ,old-start)))))
+
 (defun wait-for-test-condition (predicate &key (retries 50) (delay 0.02))
   (loop repeat retries
         when (funcall predicate)
@@ -789,6 +887,185 @@
                      *fake-events*)
                "direct /room-close should include the log path")))))
 
+(deftest room-local-bind-command-rebinds-current-room
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-1"
+                          :code "abcd"
+                          :identity "route-1"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (route-b (list :route-id "route-2"
+                          :code "efgh"
+                          :identity "route-2"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "room@groups.example.org/friend"
+               :room-jid "room@groups.example.org"
+               :room-nick "friend"
+               :body "/bind EFGH"))
+        (let ((updated (xmpp-cli/agent-rooms:find-active-room-by-jid
+                        "room@groups.example.org")))
+          (check-equal "route-2" (getf updated :route-id))
+          (check-equal "efgh" (getf updated :route-code)))
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-room-message)
+                            (search "from route abcd to efgh"
+                                    (third event))))
+                     *fake-events*)
+               "room /bind should acknowledge the new route")
+        (let ((log (xmpp-cli/util:read-file-as-string
+                    (xmpp-cli/agent-rooms:room-log-pathname room))))
+          (check (search "bound room from route abcd to efgh" log)
+                 "room /bind should write a room log entry"))))))
+
+(deftest room-bind-command-refuses-route-owned-by-another-room
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-1"
+                          :code "abcd"
+                          :identity "route-1"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (route-b (list :route-id "route-2"
+                          :code "efgh"
+                          :identity "route-2"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (source-room (list :room-jid "source@groups.example.org"
+                              :room-nick "xmpp-cli"
+                              :route-id "route-1"
+                              :route-code "abcd"
+                              :created-at now
+                              :last-activity-at now
+                              :state "active"))
+           (owned-room (list :room-jid "owned@groups.example.org"
+                             :room-nick "xmpp-cli"
+                             :route-id "route-2"
+                             :route-code "efgh"
+                             :created-at now
+                             :last-activity-at now
+                             :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (xmpp-cli/agent-rooms:save-rooms (list source-room owned-room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "source@groups.example.org/friend"
+             :room-jid "source@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "source@groups.example.org/friend"
+               :room-jid "source@groups.example.org"
+               :room-nick "friend"
+               :body "/bind efgh"))
+        (let ((source (xmpp-cli/agent-rooms:find-active-room-by-jid
+                       "source@groups.example.org"))
+              (owned (xmpp-cli/agent-rooms:find-active-room-by-jid
+                      "owned@groups.example.org")))
+          (check-equal "abcd" (getf source :route-code))
+          (check-equal "efgh" (getf owned :route-code)))
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-room-message)
+                            (search "route efgh already has room owned@groups.example.org"
+                                    (third event))
+                            (search "xmpp:owned@groups.example.org?join"
+                                    (third event))))
+                     *fake-events*)
+               "room /bind should refuse to steal another active room")))))
+
+(deftest direct-room-bind-command-rebinds-room-by-route-code
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route-a (list :route-id "route-1"
+                          :code "abcd"
+                          :identity "route-1"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (route-b (list :route-id "route-2"
+                          :code "efgh"
+                          :identity "route-2"
+                          :created-at now
+                          :last-seen-at now
+                          :last-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route-a route-b))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-direct-command
+         state
+         "friend@example.org"
+         "/room-bind abcd efgh")
+        (let ((updated (xmpp-cli/agent-rooms:find-active-room-by-jid
+                        "room@groups.example.org")))
+          (check-equal "route-2" (getf updated :route-id))
+          (check-equal "efgh" (getf updated :route-code)))
+        (check (some (lambda (event)
+                       (and (eq (first event) :send-connected-text)
+                            (search "from route abcd to efgh"
+                                    (third event))))
+                     *fake-events*)
+               "direct /room-bind should acknowledge in direct chat")))))
+
 (deftest room-prefixed-direct-command-is-not-routed-inside-room
   (with-isolated-data
     (let* ((room (list :room-jid "room@groups.example.org"
@@ -944,6 +1221,644 @@
                    "room /cancel should update route activity")
             (check (null (getf updated :last-direct-used-at))
                    "room /cancel should not update direct-chat activity")))))))
+
+(deftest room-route-text-reports-closed-session-when-codex-is-not-active
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil
+                        :tmux-pane-id "%12"))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-codex-pane-active-p (checked-routes nil)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-room-message
+           state
+           (list :kind :groupchat
+                 :from "room@groups.example.org/friend"
+                 :room-jid "room@groups.example.org"
+                 :room-nick "friend"
+                 :body "please continue"))
+          (check-equal "abcd" (getf (first checked-routes) :code))
+          (check (some (lambda (event)
+                         (and (eq (first event) :send-room-message)
+                              (search "session for route abcd is closed"
+                                      (third event))
+                              (search "/recreate" (third event))))
+                       *fake-events*)
+                 "inactive room route should explain the /recreate recovery path")
+          (let ((stored-route (xmpp-cli/agent-routes:find-route-by-id
+                               (xmpp-cli/agent-routes:load-routes)
+                               "route-1")))
+            (check-equal "stale" (getf stored-route :state))
+            (check (getf stored-route :stale-at)
+                   "inactive room route should record when it became stale")
+            (check (search "tmux pane" (getf stored-route :stale-reason))
+                   "inactive room route should record why it became stale")))))))
+
+(deftest room-local-recreate-command-rebinds-room-to-new-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-client-name "/dev/pts/45"
+                               :tmux-client-tty "/dev/pts/45"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@99"
+                              :tmux-pane-id "%99"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-start-codex-session (start-calls new-context)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-room-message
+           state
+           (list :kind :groupchat
+                 :from "room@groups.example.org/friend"
+                 :room-jid "room@groups.example.org"
+                 :room-nick "friend"
+                 :body "/recreate"))
+          (let* ((new-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                            "room@groups.example.org"))
+                 (new-route (xmpp-cli/agent-routes:find-route-by-code
+                             (getf new-room :route-code))))
+            (check-equal "session-1"
+                         (getf (first start-calls) :resume-session-id))
+            (check (not (getf (first start-calls) :focus-source-p))
+                   "/recreate should not need to focus the old pane")
+            (check (getf (first start-calls) :prefer-existing-window-p)
+                   "/recreate should prefer the old tmux window when it exists")
+            (check (not (string= "abcd" (getf new-room :route-code)))
+                   "/recreate should allocate a new route code")
+            (check-equal (getf new-route :route-id)
+                         (getf new-room :route-id))
+            (check-equal "session-1" (getf new-route :agent-session))
+            (check-equal "%99" (getf new-route :tmux-pane-id))
+            (let ((old-route (xmpp-cli/agent-routes:find-route-by-id
+                              (xmpp-cli/agent-routes:load-routes)
+                              "route-1")))
+              (check (null (xmpp-cli/agent-routes:find-route-by-code "abcd"))
+                     "/recreate should remove the old route from active lookup")
+              (check-equal "superseded" (getf old-route :state))
+              (check-equal (getf new-route :route-id)
+                           (getf old-route :superseded-by-route-id)))
+            (check (some (lambda (event)
+                           (and (eq (first event) :send-room-message)
+                                (search "recreated route abcd"
+                                        (third event))
+                                (search (getf new-room :route-code)
+                                        (third event))))
+                         *fake-events*)
+                   "/recreate should reply in the room with the new route code")
+            (let ((log (xmpp-cli/util:read-file-as-string
+                        (xmpp-cli/agent-rooms:room-log-pathname room))))
+              (check (search "recreated route abcd" log)
+                     "/recreate should write a room log entry"))))))))
+
+(deftest room-local-recreate-command-supersedes-no-session-source-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :agent :codex
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-client-name "/dev/pts/45"
+                               :tmux-client-tty "/dev/pts/45"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@99"
+                              :tmux-pane-id "%99"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-start-codex-session (start-calls new-context)
+        (let ((*fake-events* nil))
+          (xmpp-cli/agent-daemon::handle-room-message
+           state
+           (list :kind :groupchat
+                 :from "room@groups.example.org/friend"
+                 :room-jid "room@groups.example.org"
+                 :room-nick "friend"
+                 :body "/recreate"))
+          (check (null (getf (first start-calls) :resume-session-id))
+                 "/recreate should start fresh when no Codex session id is known")
+          (let* ((new-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                            "room@groups.example.org"))
+                 (new-route (xmpp-cli/agent-routes:find-route-by-code
+                             (getf new-room :route-code)))
+                 (old-route (xmpp-cli/agent-routes:find-route-by-id
+                             (xmpp-cli/agent-routes:load-routes)
+                             "route-1")))
+            (check new-route
+                   "/recreate should create an active replacement route")
+            (check (null (xmpp-cli/agent-routes:find-route-by-code "abcd"))
+                   "/recreate should deactivate the old no-session route")
+            (check-equal "superseded" (getf old-route :state))
+            (check-equal (getf new-route :route-id)
+                         (getf old-route :superseded-by-route-id))
+            (check-equal (getf new-route :route-id)
+                         (getf new-room :route-id)))
+          (check (some (lambda (event)
+                         (and (eq (first event) :send-room-message)
+                              (search "started a fresh Codex session"
+                                      (third event))))
+                       *fake-events*)
+                 "/recreate should explain that it started fresh"))))))
+
+(deftest room-local-recreate-command-refuses-live-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@99"
+                              :tmux-pane-id "%99"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-codex-pane-active-p (checked-routes t)
+        (with-fake-start-codex-session (start-calls new-context)
+          (let ((*fake-events* nil))
+            (xmpp-cli/agent-daemon::handle-room-message
+             state
+             (list :kind :groupchat
+                   :from "room@groups.example.org/friend"
+                   :room-jid "room@groups.example.org"
+                   :room-nick "friend"
+                   :body "/recreate"))
+            (check-equal "abcd" (getf (first checked-routes) :code))
+            (check (null start-calls)
+                   "/recreate should not launch a duplicate Codex session while the route is live")
+            (let ((new-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                             "room@groups.example.org")))
+              (check-equal "abcd" (getf new-room :route-code))
+              (check-equal "route-1" (getf new-room :route-id)))
+            (check (some (lambda (event)
+                           (and (eq (first event) :send-room-message)
+                                (search "route abcd is still active"
+                                        (third event))))
+                         *fake-events*)
+                   "/recreate should explain that the route is already live")))))))
+
+(deftest room-local-recreate-command-rebinds-already-active-session
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :state "superseded"
+                               :superseded-by-route-id "route-2"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (active-route (list :route-id "route-2"
+                               :code "efgh"
+                               :identity "route-2"
+                               :agent "codex"
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@99"
+                               :tmux-pane-id "%99"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@100"
+                              :tmux-pane-id "%100"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route active-route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-codex-pane-active-p
+          (checked-routes (string= "efgh" (getf route :code)))
+        (with-fake-start-codex-session (start-calls new-context)
+          (let ((*fake-events* nil))
+            (xmpp-cli/agent-daemon::handle-room-message
+             state
+             (list :kind :groupchat
+                   :from "room@groups.example.org/friend"
+                   :room-jid "room@groups.example.org"
+                   :room-nick "friend"
+                   :body "/recreate"))
+            (check (null start-calls)
+                   "/recreate should not launch a second UI for an already-active Codex session")
+            (let ((new-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                             "room@groups.example.org")))
+              (check-equal "efgh" (getf new-room :route-code))
+              (check-equal "route-2" (getf new-room :route-id)))
+            (let ((old-route (xmpp-cli/agent-routes:find-route-by-id
+                              (xmpp-cli/agent-routes:load-routes)
+                              "route-1")))
+              (check (null (xmpp-cli/agent-routes:find-route-by-code "abcd"))
+                     "/recreate should deactivate the stale route after rebinding")
+              (check-equal "superseded" (getf old-route :state))
+              (check-equal "route-2"
+                           (getf old-route :superseded-by-route-id)))
+            (check (some (lambda (event)
+                           (and (eq (first event) :send-room-message)
+                                (search "already active as route efgh"
+                                        (third event))
+                                (search "rebound this room to efgh"
+                                        (third event))))
+                         *fake-events*)
+                   "/recreate should explain that it rebound to the live route")
+            (check (equal '("efgh" "abcd")
+                          (mapcar (lambda (route)
+                                    (getf route :code))
+                                  checked-routes))
+                   "/recreate should check the room route first, then matching session routes")))))))
+
+(deftest room-local-recreate-command-refuses-active-session-owned-by-another-room
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (active-route (list :route-id "route-2"
+                               :code "efgh"
+                               :identity "route-2"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@99"
+                               :tmux-pane-id "%99"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (source-room (list :room-jid "old-room@groups.example.org"
+                              :room-nick "xmpp-cli"
+                              :route-id "route-1"
+                              :route-code "abcd"
+                              :created-at now
+                              :last-activity-at now
+                              :state "active"))
+           (existing-room (list :room-jid "live-room@groups.example.org"
+                                :room-nick "xmpp-cli"
+                                :route-id "route-2"
+                                :route-code "efgh"
+                                :created-at now
+                                :last-activity-at now
+                                :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@100"
+                              :tmux-pane-id "%100"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route active-route))
+      (xmpp-cli/agent-rooms:save-rooms (list source-room existing-room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "old-room@groups.example.org/friend"
+             :room-jid "old-room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-codex-pane-active-p
+          (checked-routes (string= "efgh" (getf route :code)))
+        (with-fake-start-codex-session (start-calls new-context)
+          (let ((*fake-events* nil))
+            (xmpp-cli/agent-daemon::handle-room-message
+             state
+             (list :kind :groupchat
+                   :from "old-room@groups.example.org/friend"
+                   :room-jid "old-room@groups.example.org"
+                   :room-nick "friend"
+                   :body "/recreate"))
+            (check (null start-calls)
+                   "/recreate should not launch when the session is already live")
+            (let ((old-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                             "old-room@groups.example.org"))
+                  (live-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                              "live-room@groups.example.org")))
+              (check-equal "abcd" (getf old-room :route-code))
+              (check-equal "route-1" (getf old-room :route-id))
+              (check-equal "efgh" (getf live-room :route-code))
+              (check-equal "route-2" (getf live-room :route-id)))
+            (check (xmpp-cli/agent-routes:find-route-by-code "abcd")
+                   "refused rebind should leave the source route active for recovery")
+            (check (some (lambda (event)
+                           (and (eq (first event) :send-room-message)
+                                (search "already active as route efgh in room live-room@groups.example.org"
+                                        (third event))
+                                (search "xmpp:live-room@groups.example.org?join"
+                                        (third event))))
+                         *fake-events*)
+                   "/recreate should point at the existing room without untracking it")))))))
+
+(deftest room-local-recreate-command-recovers-from-superseded-source-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (source-route (list :route-id "route-1"
+                               :code "abcd"
+                               :identity "route-1"
+                               :state "superseded"
+                               :superseded-by-route-id "route-2"
+                               :agent :codex
+                               :agent-session "session-1"
+                               :host "hbox"
+                               :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                               :display-cwd "~/codes/cl-projects/xmpp-cli"
+                               :tmux-socket "/tmp/tmux-1000/default"
+                               :tmux-client-name "/dev/pts/45"
+                               :tmux-client-tty "/dev/pts/45"
+                               :tmux-session-id "$1"
+                               :tmux-window-id "@3"
+                               :tmux-pane-id "%12"
+                               :created-at now
+                               :last-seen-at now
+                               :last-used-at nil
+                               :last-direct-used-at nil))
+           (dead-successor (list :route-id "route-2"
+                                 :code "efgh"
+                                 :identity "route-2"
+                                 :state "stale"
+                                 :agent :codex
+                                 :agent-session "session-1"
+                                 :host "hbox"
+                                 :cwd "/home/larme/codes/cl-projects/xmpp-cli"
+                                 :display-cwd "~/codes/cl-projects/xmpp-cli"
+                                 :tmux-socket "/tmp/tmux-1000/default"
+                                 :tmux-session-id "$1"
+                                 :tmux-window-id "@99"
+                                 :tmux-pane-id "%99"
+                                 :created-at now
+                                 :last-seen-at now
+                                 :last-used-at nil
+                                 :last-direct-used-at nil))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :code-length 4
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org"))))
+           (new-context (list :tmux-socket "/tmp/tmux-1000/default"
+                              :tmux-session-id "$1"
+                              :tmux-window-id "@100"
+                              :tmux-pane-id "%100"
+                              :tmux-pane-current-path
+                              "/home/larme/codes/cl-projects/xmpp-cli")))
+      (xmpp-cli/agent-routes:save-routes (list source-route dead-successor))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (with-fake-codex-pane-active-p (checked-routes nil)
+        (with-fake-start-codex-session (start-calls new-context)
+          (let ((*fake-events* nil))
+            (xmpp-cli/agent-daemon::handle-room-message
+             state
+             (list :kind :groupchat
+                   :from "room@groups.example.org/friend"
+                   :room-jid "room@groups.example.org"
+                   :room-nick "friend"
+                   :body "/recreate"))
+            (check-equal "session-1"
+                         (getf (first start-calls) :resume-session-id))
+            (let* ((new-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                              "room@groups.example.org"))
+                   (new-route (xmpp-cli/agent-routes:find-route-by-code
+                               (getf new-room :route-code))))
+              (check new-route
+                     "/recreate should create an active route from a superseded source")
+              (check-equal "%100" (getf new-route :tmux-pane-id))
+              (check-equal (getf new-route :route-id)
+                           (getf new-room :route-id))
+              (check (not (string= "abcd" (getf new-room :route-code)))
+                     "/recreate should bind the room to a new route code"))
+            (check (some (lambda (event)
+                           (and (eq (first event) :send-room-message)
+                                (search "recreated route abcd"
+                                        (third event))))
+                         *fake-events*)
+                   "/recreate should report successful recovery from a superseded source")))))))
 
 (deftest room-state-keeps-one-active-room-per-route
   (with-isolated-data
@@ -1399,8 +2314,9 @@
                            :state))
         (check (some (lambda (event)
                        (and (eq (first event) :send-room-message)
-                            (search "route abcd is no longer active"
-                                    (third event))))
+                            (search "session for route abcd is closed"
+                                    (third event))
+                            (search "/recreate" (third event))))
                      *fake-events*)
                "room should get a clear inactive route reply")
         (check (not (some (lambda (event)
@@ -1463,8 +2379,9 @@
                                 :state))
              (check (some (lambda (event)
                             (and (eq (first event) :send-room-message)
-                                 (search "route abcd is no longer active"
-                                         (third event))))
+                                 (search "session for route abcd is closed"
+                                         (third event))
+                                 (search "/recreate" (third event))))
                           *fake-events*)
                     "room should get a clear inactive pane reply")
              (check (not (some (lambda (event)
@@ -1664,6 +2581,149 @@
     (check-equal "$6" (getf location :tmux-session-id))
     (check-equal "@98" (getf location :tmux-window-id))))
 
+(deftest tmux-codex-pane-active-checks-current-command
+  (let ((old-run-tmux (symbol-function 'xmpp-cli/tmux::run-tmux))
+        (current-command "codex"))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'xmpp-cli/tmux::run-tmux)
+                 (lambda (arguments &key socket)
+                   (declare (ignore socket))
+                   (cond
+                     ((equal arguments
+                             '("display-message"
+                               "-p"
+                               "-t"
+                               "%12"
+                               "#{pane_id}"))
+                      "%12
+")
+                     ((equal arguments
+                             '("display-message"
+                               "-p"
+                               "-t"
+                               "%12"
+                               "#{pane_current_command}"))
+                      (format nil "~a~%" current-command))
+                     (t
+                      (error "unexpected tmux command ~s" arguments)))))
+           (let ((route (list :tmux-pane-id "%12")))
+             (check (xmpp-cli/tmux:codex-pane-active-p route)
+                    "codex command should mark the pane active")
+             (setf current-command "node")
+             (check (xmpp-cli/tmux:codex-pane-active-p route)
+                    "npm-installed Codex should be active when tmux reports node")
+             (setf current-command "bash")
+             (check (not (xmpp-cli/tmux:codex-pane-active-p route))
+                    "non-codex command should mark the pane inactive")))
+      (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux))))
+
+(deftest tmux-start-codex-session-can-resume-session-id
+  (let ((old-run-tmux (symbol-function 'xmpp-cli/tmux::run-tmux))
+        (old-codex xmpp-cli/tmux::*codex-executable*)
+        (commands nil))
+    (unwind-protect
+         (progn
+           (setf xmpp-cli/tmux::*codex-executable* "/usr/bin/codex")
+           (setf (symbol-function 'xmpp-cli/tmux::run-tmux)
+                 (lambda (arguments &key socket)
+                   (push (list arguments socket) commands)
+                   (cond
+                     ((equal (first arguments) "new-window")
+                      "%99
+")
+                     ((equal (first arguments) "display-message")
+                      "/dev/pts/45	/dev/pts/45	$1	@99
+")
+                     (t
+                      (error "unexpected tmux command ~s" arguments)))))
+           (let ((context (xmpp-cli/tmux:start-codex-session
+                           (list :tmux-socket "/tmp/tmux-1000/default"
+                                 :tmux-session-id "$1"
+                                 :tmux-pane-id "%12"
+                                 :cwd "/repo")
+                           :resume-session-id "session-1"
+                           :focus-source-p nil)))
+             (let ((new-window-command (first (first (last commands)))))
+               (check-equal '("new-window"
+                              "-d"
+                              "-P"
+                              "-F"
+                              "#{pane_id}"
+                              "-t"
+                              "$1"
+                              "-c"
+                              "/repo"
+                              "/usr/bin/codex"
+                              "resume"
+                              "session-1")
+                            new-window-command))
+             (check-equal "%99" (getf context :tmux-pane-id))
+             (check-equal "@99" (getf context :tmux-window-id))))
+      (setf xmpp-cli/tmux::*codex-executable* old-codex)
+      (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux))))
+
+(deftest tmux-start-codex-session-prefers-existing-window
+  (let ((old-run-tmux (symbol-function 'xmpp-cli/tmux::run-tmux))
+        (old-codex xmpp-cli/tmux::*codex-executable*)
+        (commands nil))
+    (unwind-protect
+         (progn
+           (setf xmpp-cli/tmux::*codex-executable* "/usr/bin/codex")
+           (setf (symbol-function 'xmpp-cli/tmux::run-tmux)
+                 (lambda (arguments &key socket)
+                   (push (list arguments socket) commands)
+                   (cond
+                     ((equal arguments
+                             '("display-message"
+                               "-p"
+                               "-t"
+                               "@3"
+                               "#{window_id}"))
+                      "@3
+")
+                     ((equal (first arguments) "split-window")
+                      "%99
+")
+                     ((and (equal (first arguments) "display-message")
+                           (equal (fourth arguments) "%99"))
+                      "/dev/pts/45	/dev/pts/45	$1	@3
+")
+                     (t
+                      (error "unexpected tmux command ~s" arguments)))))
+           (let ((context (xmpp-cli/tmux:start-codex-session
+                           (list :tmux-socket "/tmp/tmux-1000/default"
+                                 :tmux-session-id "$1"
+                                 :tmux-window-id "@3"
+                                 :tmux-pane-id "%12"
+                                 :cwd "/repo")
+                           :resume-session-id "session-1"
+                           :focus-source-p nil
+                           :prefer-existing-window-p t)))
+             (let ((split-command
+                     (find-if (lambda (entry)
+                                (equal (first (first entry)) "split-window"))
+                              commands)))
+               (check split-command
+                      "existing-window launch should use tmux split-window")
+               (check-equal '("split-window"
+                              "-d"
+                              "-P"
+                              "-F"
+                              "#{pane_id}"
+                              "-t"
+                              "@3"
+                              "-c"
+                              "/repo"
+                              "/usr/bin/codex"
+                              "resume"
+                              "session-1")
+                            (first split-command)))
+             (check-equal "%99" (getf context :tmux-pane-id))
+             (check-equal "@3" (getf context :tmux-window-id))))
+      (setf xmpp-cli/tmux::*codex-executable* old-codex)
+      (setf (symbol-function 'xmpp-cli/tmux::run-tmux) old-run-tmux))))
+
 (deftest tmux-client-line-parses-client-name
   (let ((client (xmpp-cli/tmux::parse-tmux-client-line
                  "/dev/pts/45	$6
@@ -1806,6 +2866,50 @@
                "tokens with digits should still use the default route")
         (check (null unknown-code)
                "tokens with digits should not be treated as route codes")))))
+
+(deftest agent-reply-ignores-stale-routes
+  (with-isolated-data
+    (let* ((older (xmpp-cli/util:now-iso8601 (- (get-universal-time) 60)))
+           (newer (xmpp-cli/util:now-iso8601))
+           (stale-route (list :route-id "route-a"
+                              :code "aaaa"
+                              :identity "route-a"
+                              :state "stale"
+                              :created-at older
+                              :last-seen-at newer
+                              :last-used-at nil
+                              :stale-at newer
+                              :stale-reason "tmux pane is missing"))
+           (current-route (list :route-id "route-b"
+                                :code "bbbb"
+                                :identity "route-b"
+                                :created-at older
+                                :last-seen-at older
+                                :last-used-at nil))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list stale-route current-route))
+      (multiple-value-bind (matched text default-route-p unknown-code)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "AAAA please rerun this")
+        (check (null matched)
+               "explicit stale route codes should not match a route")
+        (check (null text)
+               "explicit stale route codes should not route feedback")
+        (check (not default-route-p)
+               "explicit stale route codes should not fall back")
+        (check-equal "aaaa" unknown-code))
+      (multiple-value-bind (matched text default-route-p unknown-code)
+          (xmpp-cli/agent-daemon::resolve-route-reply
+           state
+           "please rerun this")
+        (check-equal "bbbb" (getf matched :code))
+        (check-equal "please rerun this" text)
+        (check default-route-p
+               "default direct replies should skip stale routes")
+        (check (null unknown-code)
+               "default direct replies should not report an unknown route")))))
 
 (deftest agent-new-command-resolves-explicit-and-default-route
   (with-isolated-data

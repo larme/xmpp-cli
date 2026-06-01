@@ -406,8 +406,43 @@
          (plusp (length value))
          value)))
 
-(defun ensure-new-codex-route (state source-route new-context)
-  (let* ((agent-session "")
+(defun same-codex-session-route-p (route agent-session)
+  (and agent-session
+       (string= "codex"
+                (string-downcase (string (or (getf route :agent) ""))))
+       (string= agent-session
+                (or (getf route :agent-session) ""))))
+
+(defun active-route-for-codex-session (state agent-session
+                                       &key exclude-route-id)
+  (when agent-session
+    (find-if (lambda (route)
+               (and (same-codex-session-route-p route agent-session)
+                    (not (and exclude-route-id
+                              (string= exclude-route-id
+                                       (or (getf route :route-id) ""))))
+                    (pane-active-p route)))
+             (active-routes-for-state state))))
+
+(defun same-room-p (left right)
+  (string-equal (or (getf left :room-jid) "")
+                (or (getf right :room-jid) "")))
+
+(defun existing-room-for-route (route)
+  (and route
+       (find-active-room-by-route-id (getf route :route-id))))
+
+(defun route-already-room-bound-message (source-route active-route room)
+  (format nil
+          "xmpp-cli: Codex session for route ~a is already active as route ~a in room ~a.~%join: ~a"
+          (getf source-route :code)
+          (getf active-route :code)
+          (getf room :room-jid)
+          (join-uri (getf room :room-jid))))
+
+(defun ensure-new-codex-route (state source-route new-context
+                               &key agent-session)
+  (let* ((agent-session (or agent-session ""))
          (host (plist-string source-route :host))
          (cwd (or (plist-string source-route :cwd)
                   (plist-string new-context :tmux-pane-current-path)))
@@ -489,6 +524,108 @@
                (format nil "xmpp-cli: /new failed for ~a: ~a"
                        (getf route :code)
                        condition))))))))))
+
+(defun recreate-room-success-message (old-route new-route resumed-p)
+  (format nil
+          "xmpp-cli: recreated route ~a as ~a in window ~a pane ~a~@[~%resumed Codex session: ~a~]~:[~;~%started a fresh Codex session because no resumable session id was known.~]"
+          (getf old-route :code)
+          (getf new-route :code)
+          (or (getf new-route :tmux-window-id) "unknown")
+          (or (getf new-route :tmux-pane-id) "unknown")
+          (and resumed-p (getf new-route :agent-session))
+          (not resumed-p)))
+
+(defun recreate-room-route (state room)
+  (bt:with-lock-held (*room-binding-lock*)
+    (let* ((current-room (find-active-room-by-jid (getf room :room-jid)))
+           (source-route (and current-room
+                              (or (route-for-room state current-room)
+                                  (route-record-for-room current-room)))))
+      (unless current-room
+        (error "room ~a is no longer active."
+               (getf room :room-jid)))
+      (unless source-route
+        (error "route ~a is no longer active."
+               (getf current-room :route-code)))
+      (when (pane-active-p source-route)
+        (return-from recreate-room-route
+          (format nil
+                  "xmpp-cli: route ~a is still active; /recreate is only for a closed session."
+                  (getf source-route :code))))
+      (let* ((agent-session (plist-string source-route :agent-session))
+             (active-session-route (active-route-for-codex-session
+                                    state
+                                    agent-session
+                                    :exclude-route-id
+                                    (getf source-route :route-id))))
+        (when active-session-route
+          (let ((existing-room (existing-room-for-route active-session-route)))
+            (when (and existing-room
+                       (not (same-room-p existing-room current-room)))
+              (return-from recreate-room-route
+                (route-already-room-bound-message source-route
+                                                  active-session-route
+                                                  existing-room)))
+            (let ((updated-room (rebind-room-route current-room
+                                                   active-session-route)))
+              (declare (ignore updated-room))
+              (ignore-errors
+                (mark-route-superseded source-route active-session-route))
+              (return-from recreate-room-route
+                (format nil
+                        "xmpp-cli: Codex session for route ~a is already active as route ~a in window ~a pane ~a; rebound this room to ~a."
+                        (getf source-route :code)
+                        (getf active-session-route :code)
+                        (or (getf active-session-route :tmux-window-id)
+                            "unknown")
+                        (or (getf active-session-route :tmux-pane-id)
+                            "unknown")
+                        (getf active-session-route :code)))))))
+      (let* ((agent-session (plist-string source-route :agent-session))
+             (new-context (start-codex-session source-route
+                                               :resume-session-id agent-session
+                                               :focus-source-p nil
+                                               :prefer-existing-window-p t))
+             (new-route (ensure-new-codex-route state
+                                                source-route
+                                                new-context
+                                                :agent-session agent-session))
+             (superseded-source (mark-route-superseded source-route
+                                                        new-route))
+             (updated-room (rebind-room-route current-room new-route))
+             (message (recreate-room-success-message
+                       source-route
+                       new-route
+                       (and agent-session t))))
+        (declare (ignore superseded-source))
+        (ignore-errors
+          (append-room-log-entry
+           updated-room
+           "system"
+           "xmpp-cli"
+           (format nil "recreated route ~a as ~a"
+                   (getf source-route :code)
+                   (getf new-route :code))))
+        message))))
+
+(defun handle-room-recreate-command (state room arguments)
+  (cond
+    (arguments
+     (send-room-note state
+                     (getf room :room-jid)
+                     "xmpp-cli: usage: /recreate"))
+    (t
+     (handler-case
+         (send-room-note state
+                         (getf room :room-jid)
+                         (recreate-room-route state room))
+       (error (condition)
+         (send-room-note
+          state
+          (getf room :room-jid)
+          (format nil "xmpp-cli: /recreate failed for ~a: ~a"
+                  (getf room :route-code)
+                  condition)))))))
 
 (defun boolean-config-value (value)
   (if value "1" "0"))
@@ -799,6 +936,10 @@ into a room that only the bot has joined after reconnect."
    (active-routes-for-state state)
    (getf room :route-id)))
 
+(defun route-record-for-room (room)
+  (find-route-by-id (load-routes)
+                    (getf room :route-id)))
+
 (defun handle-room-route-success (state room route text sender)
   (declare (ignore sender))
   (apply-route-reply route text)
@@ -856,6 +997,52 @@ into a room that only the bot has joined after reconnect."
                             :direct-p (eq (getf context :scope) :direct)
                             :room room
                             :default-route-p (getf context :default-route-p)))
+
+(defun bind-room-to-route-for-command (state room target-code)
+  (let ((target-route (resolve-command-route state target-code)))
+    (cond
+      ((null target-route)
+       (format nil "xmpp-cli: unknown or stale route code ~a" target-code))
+      (t
+       (let ((existing-room (existing-room-for-route target-route)))
+         (cond
+           ((and existing-room
+                 (same-room-p existing-room room))
+            (format nil "xmpp-cli: room is already bound to route ~a"
+                    (getf target-route :code)))
+           (existing-room
+            (format nil
+                    "xmpp-cli: route ~a already has room ~a.~%join: ~a"
+                    (getf target-route :code)
+                    (getf existing-room :room-jid)
+                    (join-uri (getf existing-room :room-jid))))
+           (t
+            (let* ((old-code (getf room :route-code))
+                   (updated-room (rebind-room-route room target-route)))
+              (ignore-errors
+                (append-room-log-entry
+                 updated-room
+                 "system"
+                 "xmpp-cli"
+                 (format nil "bound room from route ~a to ~a"
+                         old-code
+                         (getf target-route :code))))
+              (format nil "xmpp-cli: bound room ~a from route ~a to ~a"
+                      (getf updated-room :room-jid)
+                      old-code
+                      (getf target-route :code))))))))))
+
+(define-route-command bind
+    (:direct-name :room-prefixed
+     :room-name "bind"
+     :direct-route :required
+     :target :room
+     :min-args 1
+     :max-args 1
+     :direct-usage "/room-bind <room-route-code> <target-route-code>"
+     :room-usage "/bind <route-code>")
+  (declare (ignore route))
+  (bind-room-to-route-for-command state room (first arguments)))
 
 (defun room-log-display-path (room)
   (display-path (namestring (room-log-pathname room))))
@@ -922,6 +1109,11 @@ into a room that only the bot has joined after reconnect."
       (let ((room-jid (getf room :room-jid))
             (handler (gethash name *room-route-command-handlers*)))
         (cond
+          ((string= name "recreate")
+           (handle-room-recreate-command state
+                                         room
+                                         (split-command-arguments rest))
+           t)
           (handler
            (funcall handler state room (split-command-arguments rest))
            t)
@@ -942,7 +1134,7 @@ into a room that only the bot has joined after reconnect."
 
 (defun pane-active-p (route)
   (handler-case
-      (pane-exists-p route)
+      (codex-pane-active-p route)
     (error ()
       nil)))
 
@@ -950,8 +1142,12 @@ into a room that only the bot has joined after reconnect."
   (send-room-note
    state
    (getf room :room-jid)
-   (format nil "route ~a is no longer active"
+   (format nil "xmpp-cli: session for route ~a is closed. Use /recreate to start it again."
            (getf room :route-code))))
+
+(defun mark-route-stale-best-effort (route reason)
+  (ignore-errors
+    (mark-route-stale route reason)))
 
 (defun handle-room-route-text (state room body sender)
   (let ((route (route-for-room state room)))
@@ -959,6 +1155,9 @@ into a room that only the bot has joined after reconnect."
       ((null route)
        (send-room-inactive-route-note state room))
       ((not (pane-active-p route))
+       (mark-route-stale-best-effort
+        route
+        "tmux pane is missing or is not running Codex")
        (send-room-inactive-route-note state room))
       (t
        (handler-case

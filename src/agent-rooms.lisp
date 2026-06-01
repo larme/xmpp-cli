@@ -185,6 +185,13 @@
        (save-rooms-to-disk updated)
        room))))
 
+(defun rebind-room-route (room route &optional (now (now-iso8601)))
+  (let ((updated (copy-list room)))
+    (setf (getf updated :route-id) (getf route :route-id))
+    (setf (getf updated :route-code) (getf route :code))
+    (setf (getf updated :last-activity-at) now)
+    (upsert-room updated)))
+
 (defun update-room (room-jid function)
   (call-with-rooms-lock
    (lambda ()

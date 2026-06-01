@@ -205,6 +205,7 @@ Room commands use XEP-0045 MUC rooms for route-specific feedback:
 ```text
 /room <route-code> [room-name]
 /rooms
+/room-bind <room-route-code> <target-route-code>
 /room-close <route-code>
 ```
 
@@ -215,7 +216,9 @@ to the bound tmux pane without changing the direct-chat default route. Inside a
 room, room-local commands omit the `room-` prefix, so `/room-close ...` in a
 direct chat becomes `/close` in the room itself. `/focus` also works inside a
 room and focuses the pane bound to that room. `/cancel` sends Escape to the
-pane bound to the room without focusing it.
+pane bound to the room without focusing it. `/bind <route-code>` in a room
+rebinds that room to another current route; the direct-chat form is
+`/room-bind <room-route-code> <target-route-code>`.
 
 Rooms are closed locally only by `/close` or `/room-close <route-code>`. When a
 room is closed, `xmpp-cli` attempts to destroy the MUC room and leave it. If

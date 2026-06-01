@@ -181,7 +181,9 @@
    #:find-active-route-by-code
    #:last-active-route
    #:route-expired-p
-   #:mark-route-used))
+   #:mark-route-used
+   #:mark-route-stale
+   #:mark-route-superseded))
 
 (defpackage #:xmpp-cli/tmux
   (:use #:cl)
@@ -194,6 +196,8 @@
    #:capture-context
 	   #:context-available-p
 	   #:pane-exists-p
+   #:pane-current-command
+   #:codex-pane-active-p
 	   #:focus-pane
    #:paste-text-and-enter
    #:send-escape-key
@@ -301,6 +305,7 @@
    #:find-active-room-by-route-code
    #:find-active-room-by-route-id
    #:upsert-room
+   #:rebind-room-route
    #:mark-room-activity
    #:mark-room-closed
    #:room-log-pathname
@@ -375,14 +380,17 @@
   (:import-from #:xmpp-cli/agent-routes
                 #:canonical-route-identity
                 #:ensure-route
+                #:load-routes
                 #:load-active-routes
                 #:find-route-by-id
                 #:find-route-by-code
                 #:last-active-route
-                #:mark-route-used)
+                #:mark-route-used
+                #:mark-route-stale
+                #:mark-route-superseded)
   (:import-from #:xmpp-cli/tmux
                 #:focus-pane
-                #:pane-exists-p
+                #:codex-pane-active-p
                 #:paste-text-and-enter
                 #:send-escape-key
                 #:start-codex-session)
@@ -411,6 +419,7 @@
                 #:find-active-room-by-route-code
                 #:find-active-room-by-route-id
                 #:upsert-room
+                #:rebind-room-route
                 #:mark-room-activity
                 #:mark-room-closed
                 #:room-log-pathname

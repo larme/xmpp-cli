@@ -32,6 +32,10 @@
                      "#{session_id}"))
 
 (defparameter *post-paste-enter-delay* 0.25)
+(defparameter *codex-current-command-names*
+  ;; The npm-distributed Codex CLI runs under node, so tmux reports
+  ;; pane_current_command as "node" even though the pane is a live Codex CLI.
+  '("codex" "codex.js" "node"))
 
 (defun split-string (string delimiter)
   (let ((parts nil)
@@ -251,6 +255,47 @@
            (error ()
              nil)))))
 
+(defun window-exists-p (route)
+  (let ((window-id (getf route :tmux-window-id))
+        (socket (getf route :tmux-socket)))
+    (and window-id
+         (handler-case
+             (string= window-id
+                      (trim-line-end
+                       (run-tmux (list "display-message"
+                                       "-p"
+                                       "-t"
+                                       window-id
+                                       "#{window_id}")
+                                 :socket socket)))
+           (error ()
+             nil)))))
+
+(defun pane-current-command (route)
+  (let ((pane-id (getf route :tmux-pane-id))
+        (socket (getf route :tmux-socket)))
+    (when pane-id
+      (handler-case
+          (let ((command (trim-line-end
+                          (run-tmux (list "display-message"
+                                          "-p"
+                                          "-t"
+                                          pane-id
+                                          "#{pane_current_command}")
+                                    :socket socket))))
+            (and (plusp (length command)) command))
+        (error ()
+          nil)))))
+
+(defun codex-current-command-p (command)
+  (and command
+       (member command *codex-current-command-names*
+               :test #'string-equal)))
+
+(defun codex-pane-active-p (route)
+  (and (pane-exists-p route)
+       (codex-current-command-p (pane-current-command route))))
+
 (defun list-clients (&key session-id socket)
   (handler-case
       (let ((arguments (append (list "list-clients")
@@ -371,7 +416,41 @@
                   :tmux-pane-current-path cwd)
             location)))
 
-(defun start-codex-session (route)
+(defun codex-command-arguments (resume-session-id)
+  (let ((codex (codex-executable)))
+    (if (and resume-session-id
+             (plusp (length resume-session-id)))
+        (list codex "resume" resume-session-id)
+        (list codex))))
+
+(defun start-codex-in-window-command (window-id cwd resume-session-id)
+  (append (list "split-window"
+                "-d"
+                "-P"
+                "-F"
+                "#{pane_id}"
+                "-t"
+                window-id
+                "-c"
+                cwd)
+          (codex-command-arguments resume-session-id)))
+
+(defun start-codex-in-session-command (session-id cwd resume-session-id
+                                       &key detach-p)
+  (append (list "new-window")
+          (when detach-p (list "-d"))
+          (list "-P"
+                "-F"
+                "#{pane_id}"
+                "-t"
+                session-id
+                "-c"
+                cwd)
+          (codex-command-arguments resume-session-id)))
+
+(defun start-codex-session (route &key resume-session-id
+                                      (focus-source-p t)
+                                      prefer-existing-window-p)
   (let ((pane-id (getf route :tmux-pane-id))
         (cwd (getf route :cwd))
         (socket (getf route :tmux-socket)))
@@ -382,18 +461,21 @@
     (let ((session-id (route-session-id route)))
       (unless session-id
         (error "Route does not include a tmux session target."))
-      (focus-pane route)
-      (let ((new-pane-id (trim-line-end
-                          (run-tmux (list "new-window"
-                                           "-P"
-                                           "-F"
-                                           "#{pane_id}"
-                                           "-t"
-                                           session-id
-                                           "-c"
-                                           cwd
-                                           (codex-executable))
-                                    :socket socket))))
+      (when focus-source-p
+        (focus-pane route))
+      (let* ((window-id (getf route :tmux-window-id))
+             (command (if (and prefer-existing-window-p
+                               (window-exists-p route))
+                          (start-codex-in-window-command window-id
+                                                         cwd
+                                                         resume-session-id)
+                          (start-codex-in-session-command session-id
+                                                          cwd
+                                                          resume-session-id
+                                                          :detach-p
+                                                          (not focus-source-p))))
+             (new-pane-id (trim-line-end
+                           (run-tmux command :socket socket))))
         (unless (plusp (length new-pane-id))
-          (error "tmux new-window did not return a pane id."))
+          (error "tmux Codex launch did not return a pane id."))
         (new-codex-context new-pane-id socket cwd)))))
