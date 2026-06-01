@@ -1222,6 +1222,122 @@
             (check (null (getf updated :last-direct-used-at))
                    "room /cancel should not update direct-chat activity")))))))
 
+(deftest direct-info-command-reports-route-metadata
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :agent "codex"
+                        :agent-session "session-1"
+                        :host "hbox"
+                        :display-cwd "~/repo"
+                        :tmux-session-id "$1"
+                        :tmux-window-id "@2"
+                        :tmux-pane-id "%3"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil
+                        :state "current"))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at now
+                       :last-activity-at now
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :route-ttl-days 90))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-direct-command
+         state
+         "friend@example.org"
+         "/info abcd")
+        (let ((reply (third (first *fake-events*)))
+              (updated (xmpp-cli/agent-routes:find-route-by-code "abcd")))
+          (check (search "route abcd" reply)
+                 "direct /info should name the route")
+          (check (search "codex_session: session-1" reply)
+                 "direct /info should include the Codex session id")
+          (check (search "tmux: session=$1 window=@2 pane=%3" reply)
+                 "direct /info should include tmux ids")
+          (check (search "room: room@groups.example.org" reply)
+                 "direct /info should include bound room")
+          (check (null (getf updated :last-used-at))
+                 "direct /info should not mark route used")
+          (check (null (getf updated :last-direct-used-at))
+                 "direct /info should not change direct default route"))))))
+
+(deftest room-local-info-command-reports-bound-route
+  (with-isolated-data
+    (let* ((now (xmpp-cli/util:now-iso8601))
+           (old "2026-05-12T00:00:00+08:00")
+           (route (list :route-id "route-1"
+                        :code "abcd"
+                        :identity "route-1"
+                        :agent "codex"
+                        :agent-session "session-1"
+                        :host "hbox"
+                        :display-cwd "~/repo"
+                        :tmux-session-id "$1"
+                        :tmux-window-id "@2"
+                        :tmux-pane-id "%3"
+                        :created-at now
+                        :last-seen-at now
+                        :last-used-at nil
+                        :last-direct-used-at nil
+                        :state "current"))
+           (room (list :room-jid "room@groups.example.org"
+                       :room-nick "xmpp-cli"
+                       :route-id "route-1"
+                       :route-code "abcd"
+                       :created-at old
+                       :last-activity-at old
+                       :state "active"))
+           (state (xmpp-cli/agent-daemon::make-daemon-state
+                   :backend (make-instance 'fake-backend)
+                   :connection :fake-connection
+                   :xmpp-status :connected
+                   :agent-config (list :room-nick "xmpp-cli"
+                                       :route-ttl-days 90
+                                       :allowed-senders
+                                       '("friend@example.org")))))
+      (xmpp-cli/agent-routes:save-routes (list route))
+      (xmpp-cli/agent-rooms:save-rooms (list room))
+      (xmpp-cli/agent-daemon::remember-room-occupant
+       state
+       (list :kind :presence
+             :from "room@groups.example.org/friend"
+             :room-jid "room@groups.example.org"
+             :room-nick "friend"
+             :muc-user-p t
+             :muc-jid "friend@example.org/phone"))
+      (let ((*fake-events* nil))
+        (xmpp-cli/agent-daemon::handle-room-message
+         state
+         (list :kind :groupchat
+               :from "room@groups.example.org/friend"
+               :room-jid "room@groups.example.org"
+               :room-nick "friend"
+               :body "/info"))
+        (let ((reply (third (first *fake-events*)))
+              (updated-room (xmpp-cli/agent-rooms:find-active-room-by-jid
+                             "room@groups.example.org")))
+          (check (search "route abcd" reply)
+                 "room /info should name the bound route")
+          (check (search "codex_session: session-1" reply)
+                 "room /info should include the Codex session id")
+          (check (search "room: room@groups.example.org" reply)
+                 "room /info should include the room")
+          (check (not (string= old (getf updated-room :last-activity-at)))
+                 "room /info should mark room activity"))))))
+
 (deftest room-route-text-reports-closed-session-when-codex-is-not-active
   (with-isolated-data
     (let* ((now (xmpp-cli/util:now-iso8601))

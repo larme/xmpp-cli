@@ -998,6 +998,66 @@ into a room that only the bot has joined after reconnect."
                             :room room
                             :default-route-p (getf context :default-route-p)))
 
+(defun route-info-value (value)
+  (cond
+    ((and (stringp value) (plusp (length value)))
+     value)
+    (value
+     (princ-to-string value))
+    (t
+     "none")))
+
+(defun route-info-room (route room)
+  (or room
+      (existing-room-for-route route)))
+
+(defun route-info-for-command (route room context)
+  (let ((active-room (route-info-room route room)))
+    (when room
+      (mark-room-activity room))
+    (with-output-to-string (out nil :element-type 'character)
+      (format out "xmpp-cli: route ~a~@[ (default route)~]~%"
+              (route-info-value (getf route :code))
+              (getf context :default-route-p))
+      (format out "agent: ~a~%" (route-info-value (getf route :agent)))
+      (format out "codex_session: ~a~%"
+              (route-info-value (getf route :agent-session)))
+      (format out "route_id: ~a~%"
+              (route-info-value (getf route :route-id)))
+      (format out "state: ~a~%"
+              (route-info-value (or (getf route :state) "current")))
+      (format out "cwd: ~a~%"
+              (route-info-value
+               (or (getf route :display-cwd)
+                   (getf route :cwd))))
+      (format out "host: ~a~%" (route-info-value (getf route :host)))
+      (format out "tmux: session=~a window=~a pane=~a~%"
+              (route-info-value (getf route :tmux-session-id))
+              (route-info-value (getf route :tmux-window-id))
+              (route-info-value (getf route :tmux-pane-id)))
+      (format out "last_seen_at: ~a~%"
+              (route-info-value (getf route :last-seen-at)))
+      (format out "last_used_at: ~a~%"
+              (route-info-value (getf route :last-used-at)))
+      (format out "last_direct_used_at: ~a~%"
+              (route-info-value (getf route :last-direct-used-at)))
+      (format out "room: ~a"
+              (if active-room
+                  (getf active-room :room-jid)
+                  "none")))))
+
+(define-route-command info
+    (:direct-name :same
+     :room-name "info"
+     :direct-route :optional
+     :target :route
+     :min-args 0
+     :max-args 0
+     :direct-usage "/info [route-code]"
+     :room-usage "/info")
+  (declare (ignore arguments state))
+  (route-info-for-command route room context))
+
 (defun bind-room-to-route-for-command (state room target-code)
   (let ((target-route (resolve-command-route state target-code)))
     (cond
